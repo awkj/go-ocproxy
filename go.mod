@@ -1,6 +1,6 @@
 module github.com/doctor/go-ocproxy
 
-go 1.25.5
+go 1.26
 
 require gvisor.dev/gvisor v0.0.0-20260416192914-3278e925778d
 

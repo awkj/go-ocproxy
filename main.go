@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,112 +11,105 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
-	"github.com/doctor/go-ocproxy/internal/socks"
-	"github.com/doctor/go-ocproxy/internal/stack"
+	"github.com/doctor/go-ocproxy/socks"
+	"github.com/doctor/go-ocproxy/stack"
 )
 
-const (
-	Version = "1.0.0 (Go-gVisor rewrite)"
-)
+const Version = "1.1.0 (Go-gVisor rewrite)"
 
 func main() {
-	// 严格对齐 ocproxy 的参数规范
-	socksPort := flag.String("D", "1080", "SOCKS5 dynamic port forward (standard ocproxy flag)")
-	showVersion := flag.Bool("V", false, "Show version information")
-	
-	// 其它可选参数
+	socksPort := flag.String("D", "1080", "SOCKS5 dynamic port forward")
+	showVersion := flag.Bool("V", false, "Show version")
 	localIP := flag.String("ip", "", "Internal IPv4 address")
 	mtu := flag.Int("mtu", 1500, "MTU")
-	
+	dnsDomain := flag.String("o", "", "Default DNS domain suffix (CISCO_DEF_DOMAIN)")
+	keepalive := flag.Int("k", 0, "TCP keepalive interval in seconds (0=disabled)")
 	flag.Parse()
 
-	// 如果指定了 -V，打印版本并退出
 	if *showVersion {
 		fmt.Printf("go-ocproxy version: %s\n", Version)
-		fmt.Println("A modern rewrite of ocproxy using Google's gVisor netstack.")
 		return
 	}
 
-	// 1. 读取 OpenConnect 环境变量
-	envIP := os.Getenv("INTERNAL_IP4_ADDRESS")
 	if *localIP == "" {
-		*localIP = envIP
+		*localIP = os.Getenv("INTERNAL_IP4_ADDRESS")
 	}
 	if *localIP == "" {
-		log.Fatal("Internal IP address not set. Use -ip or run via openconnect.")
+		log.Fatal("[main] Internal IP address not set. Use -ip or run via openconnect.")
 	}
 
-	envMTU := os.Getenv("INTERNAL_IP4_MTU")
-	if envMTU != "" {
-		m, err := strconv.Atoi(envMTU)
-		if err == nil {
+	if envMTU := os.Getenv("INTERNAL_IP4_MTU"); envMTU != "" {
+		if m, err := strconv.Atoi(envMTU); err == nil {
 			*mtu = m
 		}
 	}
 
-	// 读取 DNS
-	dnsServers := []string{}
-	envDNS := os.Getenv("INTERNAL_IP4_DNS")
-	if envDNS != "" {
+	var dnsServers []string
+	if envDNS := os.Getenv("INTERNAL_IP4_DNS"); envDNS != "" {
 		dnsServers = strings.Fields(envDNS)
+	}
+
+	if *dnsDomain == "" {
+		*dnsDomain = os.Getenv("CISCO_DEF_DOMAIN")
 	}
 
 	listenAddr := "127.0.0.1:" + *socksPort
 
-	// 明确标识 Go 版本
-	log.Printf("-----------------------------------------")
-	log.Printf("  go-ocproxy %s", Version)
-	log.Printf("  Based on Google gVisor Netstack")
-	log.Printf("-----------------------------------------")
-	log.Printf("Listening:   %s (SOCKS5)", listenAddr)
-	log.Printf("Internal IP: %s", *localIP)
-	log.Printf("DNS Servers: %v", dnsServers)
-
-	// 2. 初始化 gVisor 网络栈
-	ns, err := stack.NewNetStack(*localIP, uint32(*mtu))
-	if err != nil {
-		log.Fatalf("Failed to initialize netstack: %v", err)
+	log.Printf("[main] -----------------------------------------")
+	log.Printf("[main]   go-ocproxy %s", Version)
+	log.Printf("[main] -----------------------------------------")
+	log.Printf("[main] Listening:     %s (SOCKS5)", listenAddr)
+	log.Printf("[main] Internal IP:   %s", *localIP)
+	log.Printf("[main] MTU:           %d", *mtu)
+	log.Printf("[main] DNS Servers:   %v", dnsServers)
+	if *dnsDomain != "" {
+		log.Printf("[main] DNS Domain:    %s", *dnsDomain)
+	}
+	if *keepalive > 0 {
+		log.Printf("[main] TCP Keepalive: %ds", *keepalive)
 	}
 
-	// 3. 启动 SOCKS5 服务
-	server := socks.NewServer(ns, listenAddr, dnsServers)
+	ns, err := stack.NewNetStack(*localIP, uint32(*mtu))
+	if err != nil {
+		log.Fatalf("[main] Failed to initialize netstack: %v", err)
+	}
+	if *keepalive > 0 {
+		ns.TCPKeepalive = time.Duration(*keepalive) * time.Second
+	}
+
+	server := socks.NewServer(ns, listenAddr, dnsServers, *dnsDomain)
+	if err := server.Listen(); err != nil {
+		log.Fatalf("[main] SOCKS5 listen failed: %v", err)
+	}
+
+	ctx, ctxCancel := context.WithCancel(context.Background())
+	defer ctxCancel()
+
 	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			log.Printf("SOCKS5 server error: %v", err)
+		if err := server.Serve(ctx); err != nil {
+			log.Printf("[socks] serve error: %v", err)
 		}
 	}()
 
-	// 4. 处理退出信号
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Println("Shutting down go-ocproxy...")
-		os.Exit(0)
-	}()
-
-	// 5. 获取 VPN 隧道 fd：openconnect --script-tun 通过 VPNFD 环境变量传递
 	var vpnFile *os.File
 	if vpnfdStr := os.Getenv("VPNFD"); vpnfdStr != "" {
 		fd, err := strconv.Atoi(vpnfdStr)
 		if err != nil {
-			log.Fatalf("Invalid VPNFD value %q: %v", vpnfdStr, err)
+			log.Fatalf("[main] Invalid VPNFD value %q: %v", vpnfdStr, err)
 		}
 		vpnFile = os.NewFile(uintptr(fd), "vpnfd")
 		if vpnFile == nil {
-			log.Fatalf("Failed to open VPNFD=%d", fd)
+			log.Fatalf("[main] Failed to open VPNFD=%d", fd)
 		}
 		defer vpnFile.Close()
-		log.Printf("Using VPNFD=%d for tunnel I/O", fd)
+		log.Printf("[main] Using VPNFD=%d for tunnel I/O", fd)
 	} else {
-		log.Printf("VPNFD not set, falling back to stdin/stdout")
-		vpnFile = nil
+		log.Printf("[main] VPNFD not set, falling back to stdin/stdout")
 	}
 
-	// 6. 阻塞运行协议栈 I/O
-	var input *os.File
-	var output *os.File
+	var input, output *os.File
 	if vpnFile != nil {
 		input = vpnFile
 		output = vpnFile
@@ -122,9 +117,43 @@ func main() {
 		input = os.Stdin
 		output = os.Stdout
 	}
-	if err := ns.Run(input, output); err != nil {
-		if err != os.ErrClosed && !strings.Contains(err.Error(), "file already closed") {
-			log.Fatalf("Netstack runtime error: %v", err)
+
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	statsCh := make(chan os.Signal, 1)
+	signal.Notify(statsCh, syscall.SIGUSR1)
+
+	go func() {
+		for {
+			select {
+			case sig := <-shutdownCh:
+				log.Printf("[main] received %v, shutting down gracefully...", sig)
+				ctxCancel()
+				server.Close(5 * time.Second)
+				return
+			case <-statsCh:
+				server.DumpStats()
+			}
+		}
+	}()
+
+	if err := ns.Run(ctx, input, output); err != nil {
+		if !isCleanShutdownErr(err) {
+			log.Printf("[main] netstack error: %v", err)
 		}
 	}
+	log.Printf("[main] shutdown complete")
+}
+
+func isCleanShutdownErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, os.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, syscall.EBADF) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "file already closed") ||
+		strings.Contains(msg, "use of closed") ||
+		strings.Contains(msg, "bad file descriptor")
 }
