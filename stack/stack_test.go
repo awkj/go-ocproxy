@@ -118,6 +118,13 @@ func TestRunInboundDatagram(t *testing.T) {
 	default:
 	}
 	cancel()
+	// 等 Run 真正退出再让测试 return；否则 defer app.Close() 可能跟 Run 内部
+	// 还没跑完的 net.FileConn(input) 拿 fd 的操作发生 race。
+	select {
+	case <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit within 2s after cancel")
+	}
 }
 
 // S-HEALTH-2: health check detects dead VPN via write probe

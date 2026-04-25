@@ -27,6 +27,7 @@ const (
 	dnsCacheMinTTL          = 30 * time.Second
 	dnsCacheMaxTTL          = 1 * time.Hour
 	dnsCacheFallbackTTL     = 5 * time.Minute
+	dnsCacheNegativeTTL     = 5 * time.Second // 解析失败的负缓存 TTL（短，避免 stale）
 	dnsCacheMaxSize         = 512
 	dnsCacheCleanupInterval = 60 * time.Second
 	dnsUDPTimeout           = 2 * time.Second
@@ -84,7 +85,7 @@ func (s *Stats) connClosed() {
 // ---------------------------------------------------------------------------
 
 type dnsCacheEntry struct {
-	ip     net.IP
+	ip     net.IP    // nil 表示负缓存（解析失败）
 	expiry time.Time
 }
 
@@ -97,17 +98,27 @@ func newDNSCache() *dnsCache {
 	return &dnsCache{entries: make(map[string]dnsCacheEntry)}
 }
 
-func (c *dnsCache) get(name string) (net.IP, bool) {
+// get 返回 (ip, found, negative)：
+//   - found=false：缓存里没有或已过期，调用方需要去查 DNS
+//   - found=true, negative=true：负缓存（之前查失败过，短期内别再查）
+//   - found=true, negative=false：正常命中，ip 有效
+func (c *dnsCache) get(name string) (ip net.IP, found bool, negative bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	e, ok := c.entries[name]
 	if !ok || time.Now().After(e.expiry) {
-		return nil, false
+		return nil, false, false
 	}
-	return e.ip, true
+	return e.ip, true, e.ip == nil
 }
 
+// set 写入正常解析结果。
+// 特殊处理：上游返回 TTL=0 表示"明确不要缓存"（多见于内网负载均衡的瞬变 IP），
+// 此时我们直接跳过缓存，让下次请求重新解析。这优先于 dnsCacheMinTTL 的 clamp。
 func (c *dnsCache) set(name string, ip net.IP, ttl time.Duration) {
+	if ttl == 0 {
+		return
+	}
 	ttl = max(ttl, dnsCacheMinTTL)
 	ttl = min(ttl, dnsCacheMaxTTL)
 	c.mu.Lock()
@@ -116,6 +127,18 @@ func (c *dnsCache) set(name string, ip net.IP, ttl time.Duration) {
 		c.evictOldestLocked()
 	}
 	c.entries[name] = dnsCacheEntry{ip: ip, expiry: time.Now().Add(ttl)}
+}
+
+// setNegative 写入负缓存。失败结果以 dnsCacheNegativeTTL 短暂缓存，
+// 避免 app 反复请求一个不存在的域名时把每次都打到上游 DNS。
+// TTL 故意设得很短（5s），让真域名上线后能很快被发现。
+func (c *dnsCache) setNegative(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.entries[name]; !exists && len(c.entries) >= dnsCacheMaxSize {
+		c.evictOldestLocked()
+	}
+	c.entries[name] = dnsCacheEntry{ip: nil, expiry: time.Now().Add(dnsCacheNegativeTTL)}
 }
 
 func (c *dnsCache) evictOldestLocked() {
@@ -208,6 +231,16 @@ func (s *Server) Serve(ctx context.Context) error {
 		go func() {
 			defer s.wg.Done()
 			defer func() { <-s.connLimit }()
+			// 单条连接 panic 不应该拖垮整个代理进程。本地代理对可用性敏感（同时
+			// 服务很多 app 的连接），任何一个客户端触发的异常路径——gVisor 内部
+			// panic、SOCKS 报文解析里没覆盖到的边界——都会通过 io.Copy / dial
+			// 的调用栈冒泡上来。这里 recover 掉 + 打日志，让其他 N-1 条连接继续。
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[socks] handle panic from %s: %v", conn.RemoteAddr(), r)
+					conn.Close()
+				}
+			}()
 			s.handle(conn)
 		}()
 	}
@@ -285,11 +318,32 @@ func (s *Server) handle(conn net.Conn) {
 		conn.Write([]byte{socksVer5, socksNoAcceptable})
 		return
 	}
-	if nMethods := int(buf[1]); nMethods > 0 {
-		if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
-			log.Printf("[socks] %s handshake read methods failed: %v", remote, err)
-			return
+	// RFC 1928 §3：客户端发 (VER, NMETHODS, METHODS[NMETHODS])。
+	// 我们只支持 NOAUTH (0x00)。严格按 spec：
+	//   - 必须读完所有 METHODS 字节，否则后面会把它们当作 request 报文乱解。
+	//   - 客户端必须在 METHODS 列表里包含 0x00；没有则回 0xFF 拒绝（spec §3）。
+	//   - NMETHODS=0 是非法报文，按拒绝处理。
+	nMethods := int(buf[1])
+	if nMethods == 0 {
+		log.Printf("[socks] %s NMETHODS=0, rejecting", remote)
+		conn.Write([]byte{socksVer5, socksNoAcceptable})
+		return
+	}
+	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
+		log.Printf("[socks] %s handshake read methods failed: %v", remote, err)
+		return
+	}
+	hasNoAuth := false
+	for _, m := range buf[:nMethods] {
+		if m == 0x00 {
+			hasNoAuth = true
+			break
 		}
+	}
+	if !hasNoAuth {
+		log.Printf("[socks] %s no acceptable auth method offered: %x", remote, buf[:nMethods])
+		conn.Write([]byte{socksVer5, socksNoAcceptable})
+		return
 	}
 	if _, err := conn.Write([]byte{socksVer5, 0x00}); err != nil {
 		log.Printf("[socks] %s handshake write failed: %v", remote, err)
@@ -421,8 +475,13 @@ func (s *Server) handle(conn net.Conn) {
 // ---------------------------------------------------------------------------
 
 func (s *Server) resolve(ctx context.Context, name string) (net.IP, error) {
-	if ip, ok := s.cache.get(name); ok {
+	// 缓存查询有三种结果：命中正常 / 命中负缓存（最近失败过）/ 未命中
+	if ip, found, negative := s.cache.get(name); found {
 		s.Stats.DNSCacheHit.Add(1)
+		if negative {
+			// 短期内已经查过且失败过，直接返回失败避免反复打上游 DNS
+			return nil, fmt.Errorf("negative cache hit for %s", name)
+		}
 		return ip, nil
 	}
 	s.Stats.DNSCacheMiss.Add(1)
@@ -446,6 +505,8 @@ func (s *Server) resolve(ctx context.Context, name string) (net.IP, error) {
 	}
 
 	if err != nil {
+		// 写入负缓存：5s 内同一域名再来也直接失败，不打 DNS
+		s.cache.setNegative(name)
 		return nil, err
 	}
 	s.cache.set(name, ip, ttl)
@@ -577,11 +638,22 @@ func (s *Server) queryTCP(ctx context.Context, addr *tcpip.FullAddress, query []
 	return resp, nil
 }
 
+// EDNS0 UDP payload size：告诉 DNS 服务器我们能收多大的 UDP 响应。
+// 1232 = 1280 (IPv6 最小 MTU) - 40 (IPv6 头) - 8 (UDP 头)，是 DNS Flag Day
+// 推荐值，能避免 IP 分片同时容纳绝大多数响应。
+const ednsUDPSize = 1232
+
 func buildDNSQuery(name string, id uint16) ([]byte, error) {
+	// DNS 报文头 12 字节：ID(2) FLAGS(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
 	buf := make([]byte, 12, 64)
 	binary.BigEndian.PutUint16(buf[0:2], id)
-	binary.BigEndian.PutUint16(buf[2:4], 0x0100)
-	binary.BigEndian.PutUint16(buf[4:6], 1)
+	binary.BigEndian.PutUint16(buf[2:4], 0x0100) // 标准查询，RD=1（递归）
+	binary.BigEndian.PutUint16(buf[4:6], 1)      // QDCOUNT = 1
+	// ANCOUNT(6:8) / NSCOUNT(8:10) 默认 0
+	// ARCOUNT(10:12) = 1，对应下面附加的 OPT pseudo-RR
+	binary.BigEndian.PutUint16(buf[10:12], 1)
+
+	// Question section
 	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
 		if len(label) == 0 || len(label) > 63 {
 			return nil, fmt.Errorf("invalid dns label %q", label)
@@ -589,8 +661,23 @@ func buildDNSQuery(name string, id uint16) ([]byte, error) {
 		buf = append(buf, byte(len(label)))
 		buf = append(buf, label...)
 	}
-	buf = append(buf, 0)
-	buf = append(buf, 0, 1, 0, 1)
+	buf = append(buf, 0)          // 根 label 结束
+	buf = append(buf, 0, 1, 0, 1) // QTYPE=A, QCLASS=IN
+
+	// EDNS0 OPT pseudo-RR (RFC 6891)：
+	// 不声明 EDNS 时，UDP 响应被 RFC 1035 默认 512 字节封顶，超过会 TC=1
+	// 强制走 TCP 重查一次（多一个 RTT）。声明 OPT 后服务器可以直接回 1232
+	// 字节的 UDP 响应，绝大多数大响应（多 A 记录、长 CNAME 链）一次到位。
+	//
+	// 编码格式：
+	//   NAME(1)=0 (root)  TYPE(2)=41(OPT)  CLASS(2)=UDP payload size
+	//   TTL(4)=ext-rcode|version|flags=0   RDLENGTH(2)=0  RDATA=空
+	buf = append(buf, 0)                 // root domain
+	buf = append(buf, 0x00, 0x29)        // TYPE = 41 (OPT)
+	buf = append(buf, 0x00, 0x00)        // CLASS（先占位，下面填真正 size）
+	binary.BigEndian.PutUint16(buf[len(buf)-2:], ednsUDPSize)
+	buf = append(buf, 0x00, 0x00, 0x00, 0x00) // TTL：全 0（无 ext-rcode/flags）
+	buf = append(buf, 0x00, 0x00)             // RDLENGTH = 0
 	return buf, nil
 }
 

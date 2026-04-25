@@ -144,14 +144,35 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 	// Outbound: gVisor -> VPN
 	go func() {
 		defer cancel()
+
+		// transient 错误（EAGAIN / ENOBUFS 等）按秒聚合：避免 VPN 抖动时每丢一个
+		// 包打一行日志把屏幕刷爆。这里把计数和上次打印时间放在循环本地变量里，
+		// 全部由本 goroutine 读写，无数据竞争。
+		var droppedSinceLast int
+		var lastDropErr error
+		lastLogAt := time.Now()
+
 		for {
+			// channel.Endpoint.ReadContext 返回的 *PacketBuffer 引用计数 = 1，
+			// 调用方持有这一份引用，必须 DecRef 释放。否则每出一个包就泄漏一个
+			// PacketBuffer 池里的槽位，长跑高吞吐场景会吃光内存。
+			//
+			// 注意：buf.Release() 释放的是 ToBuffer() 返回的临时副本，跟 pkt 本体
+			// 的引用计数完全是两码事，不能混淆。
 			pkt := ns.Link.ReadContext(innerCtx)
 			if pkt == nil {
+				// 退出前若还有累计的丢包，flush 一行日志免得静默丢失信息
+				if droppedSinceLast > 0 {
+					log.Printf("[stack] outbound dropped %d pkt before exit (last err: %v)",
+						droppedSinceLast, lastDropErr)
+				}
 				return
 			}
 			buf := pkt.ToBuffer()
 			_, err := output.Write(buf.Flatten())
 			buf.Release()
+			pkt.DecRef()
+
 			if err == nil {
 				continue
 			}
@@ -160,11 +181,33 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 				errCh <- fmt.Errorf("outbound write fatal: %w", err)
 				return
 			}
-			log.Printf("[stack] outbound write transient (dropping 1 pkt): %v", err)
+			// transient：累计计数；每秒最多打一行
+			droppedSinceLast++
+			lastDropErr = err
+			if time.Since(lastLogAt) >= time.Second {
+				log.Printf("[stack] outbound dropped %d pkt in last %v (last err: %v)",
+					droppedSinceLast, time.Since(lastLogAt).Round(time.Millisecond), lastDropErr)
+				droppedSinceLast = 0
+				lastDropErr = nil
+				lastLogAt = time.Now()
+			}
 		}
 	}()
 
-	// Health check: 每秒 0 字节 write 探测 VPN 是否存活
+	// 健康检查：每秒探测 VPN 对端是否还在。
+	//
+	// 为什么需要：AF_UNIX SOCK_DGRAM 是数据报，没有 TCP 那种 EOF 概念——对端
+	// close 之后，本端的 Read 不一定立刻返回错误（macOS 上实测会一直阻塞），
+	// inbound 那条退出路径不可靠。所以必须有一个独立 goroutine 主动探。
+	//
+	// 探测手段为什么是 getpeername 而不是 write：
+	//   - 0 字节 write 在某些平台是 no-op，探不出来
+	//   - 真正发探测包又会污染 VPN 流量
+	//   - getpeername 在 macOS 上对 socketpair 派生的 SOCK_DGRAM，对端关闭后
+	//     会返回 ENOTCONN（已通过 TestRunHealthCheckDetectsDeadVPN 验证）
+	//
+	// 局限：Linux 上 getpeername 的行为可能不一致（不同内核版本）；本项目
+	// 只跑在 macOS 上（D-Bar 是 macOS 菜单栏 app），暂不处理。
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -175,9 +218,6 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 			case <-ticker.C:
 				var probeErr error
 				rawOutput.Control(func(fd uintptr) {
-					// getpeername 最可靠：对端关闭后返回 ENOTCONN。
-					// write 探测在不同平台行为不一致（macOS: ECONNRESET/EDESTADDRREQ,
-					// Linux: ECONNREFUSED/EPIPE），且 0 字节 write 在部分平台无效。
 					_, probeErr = syscall.Getpeername(int(fd))
 				})
 				if probeErr == nil {
@@ -215,6 +255,11 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 			Payload: buffer.MakeWithData(data),
 		})
 		ns.Link.InjectInbound(ipv4.ProtocolNumber, pk)
+		// NewPacketBuffer 返回时引用计数 = 1（调用方持有）。InjectInbound 内部
+		// 会自己 IncRef 把包交给协议栈处理直到完成；调用方仍要 DecRef 自己那
+		// 一份初始引用，否则入站每个包都会泄漏一个 PacketBuffer 池槽位。
+		// 入站吞吐通常远大于出站（下载场景），这条泄漏比出站更致命。
+		pk.DecRef()
 	}
 }
 

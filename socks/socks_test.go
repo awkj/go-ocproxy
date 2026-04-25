@@ -20,18 +20,46 @@ func TestDNSCacheBasic(t *testing.T) {
 
 	// set + get
 	c.set("example.com", net.IPv4(1, 2, 3, 4), 60*time.Second)
-	ip, ok := c.get("example.com")
+	ip, ok, neg := c.get("example.com")
 	if !ok {
 		t.Fatal("expected cache hit")
+	}
+	if neg {
+		t.Fatal("expected positive entry, got negative")
 	}
 	if !ip.Equal(net.IPv4(1, 2, 3, 4)) {
 		t.Fatalf("got %v, want 1.2.3.4", ip)
 	}
 
 	// miss
-	_, ok = c.get("notfound.com")
+	_, ok, _ = c.get("notfound.com")
 	if ok {
 		t.Fatal("expected cache miss")
+	}
+}
+
+func TestDNSCacheNegative(t *testing.T) {
+	c := newDNSCache()
+	c.setNegative("nx.example.com")
+
+	ip, ok, neg := c.get("nx.example.com")
+	if !ok {
+		t.Fatal("expected negative cache hit")
+	}
+	if !neg {
+		t.Fatal("expected negative flag")
+	}
+	if ip != nil {
+		t.Fatalf("negative entry should have nil IP, got %v", ip)
+	}
+}
+
+func TestDNSCacheTTLZeroSkipped(t *testing.T) {
+	c := newDNSCache()
+	// TTL=0 表示上游明确不让缓存，set 应该直接跳过
+	c.set("nocache.example.com", net.IPv4(1, 1, 1, 1), 0)
+	if _, ok, _ := c.get("nocache.example.com"); ok {
+		t.Fatal("TTL=0 entries should not be cached")
 	}
 }
 
@@ -46,7 +74,7 @@ func TestDNSCacheExpiry(t *testing.T) {
 	}
 	c.mu.Unlock()
 
-	_, ok := c.get("expired.com")
+	_, ok, _ := c.get("expired.com")
 	if ok {
 		t.Fatal("expected expired entry to be a miss")
 	}
@@ -94,7 +122,7 @@ func TestDNSCacheMaxSize(t *testing.T) {
 	}
 
 	// 新条目可查到
-	ip, ok := c.get("overflow.com")
+	ip, ok, _ := c.get("overflow.com")
 	if !ok || !ip.Equal(net.IPv4(9, 9, 9, 9)) {
 		t.Fatal("newly added entry should be retrievable")
 	}
@@ -113,7 +141,7 @@ func TestDNSCacheEvictExpired(t *testing.T) {
 	if c.size() != 1 {
 		t.Fatalf("expected 1 entry after eviction, got %d", c.size())
 	}
-	if _, ok := c.get("alive"); !ok {
+	if _, ok, _ := c.get("alive"); !ok {
 		t.Fatal("alive entry should survive eviction")
 	}
 }
