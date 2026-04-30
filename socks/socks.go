@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/doctor/go-ocproxy/stack"
+	"github.com/awkj/go-ocproxy/stack"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 

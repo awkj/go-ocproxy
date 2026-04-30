@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/doctor/go-ocproxy/socks"
-	"github.com/doctor/go-ocproxy/stack"
+	"github.com/awkj/go-ocproxy/socks"
+	"github.com/awkj/go-ocproxy/stack"
 )
 
 const Version = "1.1.0 (Go-gVisor rewrite)"

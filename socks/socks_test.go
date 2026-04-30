@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/doctor/go-ocproxy/stack"
+	"github.com/awkj/go-ocproxy/stack"
 )
 
 // ===========================================================================
