@@ -3,12 +3,14 @@ package socks
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"maps"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/awkj/go-ocproxy/stack"
+	"golang.org/x/net/dns/dnsmessage"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
@@ -38,18 +41,25 @@ const (
 	socksDialTimeout      = 15 * time.Second
 	maxConnections        = 1024
 
-	socksVer5          = 0x05
-	socksCmdConnect    = 0x01
-	socksAtypIPv4      = 0x01
-	socksAtypDomain    = 0x03
-	socksAtypIPv6      = 0x04
-	socksRepOK         = 0x00
-	socksRepGenFail    = 0x01
+	socksVer5       = 0x05
+	socksCmdConnect = 0x01
+	socksAtypIPv4   = 0x01
+	socksAtypDomain = 0x03
+	socksAtypIPv6   = 0x04
+	socksRepOK      = 0x00
+	// socksRepGenFail = 0x01 — RFC 1928 通用失败码。SPEC SK-LIMIT-1 提到
+	// 「连接达上限回复 REP=0x01」，当前实现在 Accept 后直接 close（更省
+	// 资源，但跟 SPEC 不严格一致）。如未来收紧到完整握手 + 拒绝，再启用。
 	socksRepHostUnrch  = 0x04
 	socksRepCmdNotSupp = 0x07
 	socksRepAddrNotSup = 0x08
 	socksNoAcceptable  = 0xFF
 )
+
+// errDNSRcode 标记 DNS 服务器明确给出非 0 的 rcode（NXDOMAIN/SERVFAIL/REFUSED 等）。
+// 这种回复表示服务器已经"作出决定"，跨服务器或重试同一服务器拿到不同结果的概率极低，
+// queryDNS 检测到后直接 fail-fast，避免浪费 dnsMaxAttempts 个 RTT。
+var errDNSRcode = errors.New("dns rcode")
 
 // ---------------------------------------------------------------------------
 // Stats — 运行时统计
@@ -85,7 +95,7 @@ func (s *Stats) connClosed() {
 // ---------------------------------------------------------------------------
 
 type dnsCacheEntry struct {
-	ip     net.IP    // nil 表示负缓存（解析失败）
+	ip     net.IP // nil 表示负缓存（解析失败）
 	expiry time.Time
 }
 
@@ -227,9 +237,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			continue
 		}
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.wg.Go(func() {
 			defer func() { <-s.connLimit }()
 			// 单条连接 panic 不应该拖垮整个代理进程。本地代理对可用性敏感（同时
 			// 服务很多 app 的连接），任何一个客户端触发的异常路径——gVisor 内部
@@ -242,7 +250,7 @@ func (s *Server) Serve(ctx context.Context) error {
 				}
 			}()
 			s.handle(conn)
-		}()
+		})
 	}
 }
 
@@ -333,14 +341,7 @@ func (s *Server) handle(conn net.Conn) {
 		log.Printf("[socks] %s handshake read methods failed: %v", remote, err)
 		return
 	}
-	hasNoAuth := false
-	for _, m := range buf[:nMethods] {
-		if m == 0x00 {
-			hasNoAuth = true
-			break
-		}
-	}
-	if !hasNoAuth {
+	if !slices.Contains(buf[:nMethods], byte(0x00)) {
 		log.Printf("[socks] %s no acceptable auth method offered: %x", remote, buf[:nMethods])
 		conn.Write([]byte{socksVer5, socksNoAcceptable})
 		return
@@ -378,6 +379,11 @@ func (s *Server) handle(conn net.Conn) {
 			return
 		}
 		domainLen := int(buf[0])
+		if domainLen == 0 {
+			log.Printf("[socks] %s empty domain name, rejecting", remote)
+			socksReply(conn, socksRepAddrNotSup)
+			return
+		}
 		if _, err := io.ReadFull(conn, buf[:domainLen]); err != nil {
 			log.Printf("[socks] %s read domain failed: %v", remote, err)
 			return
@@ -421,6 +427,14 @@ func (s *Server) handle(conn net.Conn) {
 	// --- 3. Connect via NetStack ---
 	log.Printf("[socks] %s -> %s (%s):%d", remote, host, targetIP4, port)
 
+	// 在 dial 前清掉 conn 的握手 deadline。理由：
+	//   - 握手阶段 30s deadline 是绝对时间。dial 自己有 socksDialTimeout=15s。
+	//   - 如果握手已用 ~16s + dial 用了 ~14s，握手 deadline 触发，后续给客户端写
+	//     reply 的时候 conn 已经处于 deadline 过期状态，Write 立刻失败。
+	//   - 这条连接的"防 slowloris"职责到此结束（已读到完整 request），后面 dial
+	//     和数据转发都有自己的时限或对端控制，不再需要 conn 级别 deadline。
+	conn.SetDeadline(time.Time{})
+
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), socksDialTimeout)
 	defer dialCancel()
 
@@ -438,36 +452,37 @@ func (s *Server) handle(conn net.Conn) {
 		return
 	}
 
-	conn.SetDeadline(time.Time{})
-
 	// --- 4. Bidirectional copy with half-close ---
-	var bytesIn, bytesOut int64
-	errCh := make(chan error, 2)
-
-	go func() {
-		n, err := io.Copy(tunnel, conn)
-		bytesIn = n
+	//
+	// 字节计数用 atomic 而非局部变量：原本 `var bytesIn, bytesOut int64` + 子
+	// goroutine 写、main goroutine 读，虽然靠 channel 提供了 happens-before，
+	// 但用 -race 仍可能误报，且语义脆弱。换 atomic.Int64 一劳永逸。
+	//
+	// sync.WaitGroup.Go (Go 1.25) 替代 errCh + 两次 <-errCh 的样板。
+	var bytesIn, bytesOut atomic.Int64
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		n, _ := io.Copy(tunnel, conn)
+		bytesIn.Store(n)
 		if cw, ok := tunnel.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
-		errCh <- err
-	}()
-	go func() {
-		n, err := io.Copy(conn, tunnel)
-		bytesOut = n
+	})
+	wg.Go(func() {
+		n, _ := io.Copy(conn, tunnel)
+		bytesOut.Store(n)
 		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
-		errCh <- err
-	}()
-	<-errCh
-	<-errCh
+	})
+	wg.Wait()
 
-	s.Stats.BytesIn.Add(bytesIn)
-	s.Stats.BytesOut.Add(bytesOut)
+	bin, bout := bytesIn.Load(), bytesOut.Load()
+	s.Stats.BytesIn.Add(bin)
+	s.Stats.BytesOut.Add(bout)
 
 	dur := time.Since(start).Round(time.Millisecond)
-	log.Printf("[socks] %s -> %s closed, duration=%s in=%d out=%d", remote, host, dur, bytesIn, bytesOut)
+	log.Printf("[socks] %s -> %s closed, duration=%s in=%d out=%d", remote, host, dur, bin, bout)
 }
 
 // ---------------------------------------------------------------------------
@@ -490,18 +505,21 @@ func (s *Server) resolve(ctx context.Context, name string) (net.IP, error) {
 	var ttl time.Duration
 	var err error
 
-	if strings.Contains(name, ".") {
+	switch {
+	case strings.Contains(name, "."):
+		// FQDN：只查原始名称（SPEC DNS-SUFFIX-3）。例如 www.google.com 不会
+		// 衍生出 www.google.com.corp.example.com 这种没意义的查询。
 		ip, ttl, err = s.queryDNS(ctx, name)
-		if err != nil && s.dnsDomain != "" {
+	case s.dnsDomain != "":
+		// 裸名 + 配置了后缀：先查原始（SPEC DNS-SUFFIX-2），失败再带后缀。
+		// 顺序顺着 SPEC：万一裸名本身在公网就有解析，优先用它。
+		ip, ttl, err = s.queryDNS(ctx, name)
+		if err != nil {
 			ip, ttl, err = s.queryDNS(ctx, name+"."+s.dnsDomain)
 		}
-	} else {
-		if s.dnsDomain != "" {
-			ip, ttl, err = s.queryDNS(ctx, name+"."+s.dnsDomain)
-		}
-		if s.dnsDomain == "" || err != nil {
-			ip, ttl, err = s.queryDNS(ctx, name)
-		}
+	default:
+		// 裸名 + 无后缀配置：直接查
+		ip, ttl, err = s.queryDNS(ctx, name)
 	}
 
 	if err != nil {
@@ -535,6 +553,17 @@ func (s *Server) queryDNS(ctx context.Context, name string) (net.IP, time.Durati
 		if err == nil && ip != nil {
 			return ip, ttl, nil
 		}
+		// rcode 类错误（NXDOMAIN/SERVFAIL/REFUSED）是服务器的明确判定，
+		// 跨服务器或重试拿到不同结果概率极低，直接返回避免浪费 RTT。
+		if errors.Is(err, errDNSRcode) {
+			return nil, 0, err
+		}
+		// 兜底：dnsQuery 返回 (nil, 0, nil) 不应该发生，但若发生不能让 lastErr
+		// 一直是 nil 而 fall through 到 `return nil, 0, nil`——上层会把 nil IP
+		// 当成正常结果写入缓存，污染后续查询。
+		if err == nil {
+			err = fmt.Errorf("dns query for %q returned no result", name)
+		}
 		lastErr = err
 	}
 	return nil, 0, lastErr
@@ -549,8 +578,14 @@ func (s *Server) dnsQuery(ctx context.Context, name, server string) (net.IP, tim
 	if !strings.Contains(dnsAddr, ":") {
 		dnsAddr += ":53"
 	}
-	host, portStr, _ := net.SplitHostPort(dnsAddr)
-	port, _ := strconv.Atoi(portStr)
+	host, portStr, err := net.SplitHostPort(dnsAddr)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid dns server %q: %w", server, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid dns server port %q: %w", portStr, err)
+	}
 	parsed := net.ParseIP(host).To4()
 	if parsed == nil {
 		return nil, 0, &net.AddrError{Err: "invalid dns server", Addr: host}
@@ -573,7 +608,12 @@ func (s *Server) dnsQuery(ctx context.Context, name, server string) (net.IP, tim
 	resp, tcpErr := s.queryTCP(ctx, addr, query)
 	if tcpErr != nil {
 		if udpErr != nil {
-			return nil, 0, fmt.Errorf("udp: %v; tcp: %v", udpErr, tcpErr)
+			// errors.Join (Go 1.20)：保留双侧 error，调用方可用 errors.Is
+			// 穿透到具体 syscall errno（比如 errors.Is(err, context.DeadlineExceeded)）。
+			return nil, 0, errors.Join(
+				fmt.Errorf("udp: %w", udpErr),
+				fmt.Errorf("tcp: %w", tcpErr),
+			)
 		}
 		return nil, 0, tcpErr
 	}
@@ -643,112 +683,94 @@ func (s *Server) queryTCP(ctx context.Context, addr *tcpip.FullAddress, query []
 // 推荐值，能避免 IP 分片同时容纳绝大多数响应。
 const ednsUDPSize = 1232
 
+// buildDNSQuery 构造一个带 EDNS0 OPT 的 A 记录查询。
+//
+// 实现细节用 golang.org/x/net/dns/dnsmessage 的 Builder：标准库附属包，
+// 内部全是 append 不依赖反射，等价于手写但少了 ~80 行 off+10 之类的偏移量
+// 算术，封掉了一整类 buffer overrun bug。
 func buildDNSQuery(name string, id uint16) ([]byte, error) {
-	// DNS 报文头 12 字节：ID(2) FLAGS(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
-	buf := make([]byte, 12, 64)
-	binary.BigEndian.PutUint16(buf[0:2], id)
-	binary.BigEndian.PutUint16(buf[2:4], 0x0100) // 标准查询，RD=1（递归）
-	binary.BigEndian.PutUint16(buf[4:6], 1)      // QDCOUNT = 1
-	// ANCOUNT(6:8) / NSCOUNT(8:10) 默认 0
-	// ARCOUNT(10:12) = 1，对应下面附加的 OPT pseudo-RR
-	binary.BigEndian.PutUint16(buf[10:12], 1)
-
-	// Question section
-	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
-		if len(label) == 0 || len(label) > 63 {
-			return nil, fmt.Errorf("invalid dns label %q", label)
-		}
-		buf = append(buf, byte(len(label)))
-		buf = append(buf, label...)
+	if name == "" {
+		return nil, fmt.Errorf("empty dns name")
 	}
-	buf = append(buf, 0)          // 根 label 结束
-	buf = append(buf, 0, 1, 0, 1) // QTYPE=A, QCLASS=IN
+	// dnsmessage.NewName 要求以 "." 结尾的 FQDN
+	fqdn := name
+	if !strings.HasSuffix(fqdn, ".") {
+		fqdn += "."
+	}
+	qname, err := dnsmessage.NewName(fqdn)
+	if err != nil {
+		return nil, fmt.Errorf("invalid dns name %q: %w", name, err)
+	}
 
-	// EDNS0 OPT pseudo-RR (RFC 6891)：
-	// 不声明 EDNS 时，UDP 响应被 RFC 1035 默认 512 字节封顶，超过会 TC=1
-	// 强制走 TCP 重查一次（多一个 RTT）。声明 OPT 后服务器可以直接回 1232
-	// 字节的 UDP 响应，绝大多数大响应（多 A 记录、长 CNAME 链）一次到位。
-	//
-	// 编码格式：
-	//   NAME(1)=0 (root)  TYPE(2)=41(OPT)  CLASS(2)=UDP payload size
-	//   TTL(4)=ext-rcode|version|flags=0   RDLENGTH(2)=0  RDATA=空
-	buf = append(buf, 0)                 // root domain
-	buf = append(buf, 0x00, 0x29)        // TYPE = 41 (OPT)
-	buf = append(buf, 0x00, 0x00)        // CLASS（先占位，下面填真正 size）
-	binary.BigEndian.PutUint16(buf[len(buf)-2:], ednsUDPSize)
-	buf = append(buf, 0x00, 0x00, 0x00, 0x00) // TTL：全 0（无 ext-rcode/flags）
-	buf = append(buf, 0x00, 0x00)             // RDLENGTH = 0
-	return buf, nil
+	b := dnsmessage.NewBuilder(make([]byte, 0, 64), dnsmessage.Header{
+		ID:               id,
+		RecursionDesired: true,
+	})
+	if err := b.StartQuestions(); err != nil {
+		return nil, err
+	}
+	if err := b.Question(dnsmessage.Question{
+		Name:  qname,
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}); err != nil {
+		return nil, err
+	}
+	// EDNS0 OPT pseudo-RR (RFC 6891)：不声明时 UDP 响应封顶 512 字节，超过会
+	// TC=1 强制 TCP 重查（多一个 RTT）。声明后服务器可以直接回 1232 字节。
+	if err := b.StartAdditionals(); err != nil {
+		return nil, err
+	}
+	var rh dnsmessage.ResourceHeader
+	if err := rh.SetEDNS0(ednsUDPSize, dnsmessage.RCodeSuccess, false); err != nil {
+		return nil, err
+	}
+	if err := b.OPTResource(rh, dnsmessage.OPTResource{}); err != nil {
+		return nil, err
+	}
+	return b.Finish()
 }
 
+// parseDNSResponse 解析响应，返回第一个 A 记录的 IP + TTL。
+// 用 dnsmessage.Parser 取代手写状态机：CNAME 链、name compression、
+// answer section 边界全由库处理。
 func parseDNSResponse(resp []byte, expectedID uint16) (net.IP, time.Duration, error) {
-	if len(resp) < 12 {
-		return nil, 0, fmt.Errorf("dns response too short: %d", len(resp))
+	var p dnsmessage.Parser
+	h, err := p.Start(resp)
+	if err != nil {
+		return nil, 0, fmt.Errorf("parse dns header: %w", err)
 	}
-	if binary.BigEndian.Uint16(resp[0:2]) != expectedID {
+	if h.ID != expectedID {
 		return nil, 0, fmt.Errorf("dns id mismatch")
 	}
-	flags := binary.BigEndian.Uint16(resp[2:4])
-	if rcode := flags & 0x0F; rcode != 0 {
-		return nil, 0, fmt.Errorf("dns rcode %d", rcode)
+	if h.RCode != dnsmessage.RCodeSuccess {
+		// errDNSRcode 让 queryDNS 能 errors.Is 检测出来 fail-fast。
+		return nil, 0, fmt.Errorf("%w %d", errDNSRcode, int(h.RCode))
 	}
-	qdCount := binary.BigEndian.Uint16(resp[4:6])
-	anCount := binary.BigEndian.Uint16(resp[6:8])
-
-	off := 12
-	for range qdCount {
-		newOff, err := skipDNSName(resp, off)
-		if err != nil {
-			return nil, 0, err
-		}
-		off = newOff + 4
-		if off > len(resp) {
-			return nil, 0, fmt.Errorf("dns question truncated")
-		}
+	if err := p.SkipAllQuestions(); err != nil {
+		return nil, 0, fmt.Errorf("skip questions: %w", err)
 	}
-	for range anCount {
-		newOff, err := skipDNSName(resp, off)
+	for {
+		ah, err := p.AnswerHeader()
+		if errors.Is(err, dnsmessage.ErrSectionDone) {
+			break
+		}
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, fmt.Errorf("parse answer header: %w", err)
 		}
-		off = newOff
-		if off+10 > len(resp) {
-			return nil, 0, fmt.Errorf("dns answer header truncated")
+		if ah.Type != dnsmessage.TypeA {
+			// CNAME / AAAA / 其他记录跳过。Parser 知道每种 RR 的边界。
+			if err := p.SkipAnswer(); err != nil {
+				return nil, 0, fmt.Errorf("skip answer: %w", err)
+			}
+			continue
 		}
-		rtype := binary.BigEndian.Uint16(resp[off : off+2])
-		ttl := binary.BigEndian.Uint32(resp[off+4 : off+8])
-		rdLen := binary.BigEndian.Uint16(resp[off+8 : off+10])
-		off += 10
-		if off+int(rdLen) > len(resp) {
-			return nil, 0, fmt.Errorf("dns rdata truncated")
+		a, err := p.AResource()
+		if err != nil {
+			return nil, 0, fmt.Errorf("parse A: %w", err)
 		}
-		if rtype == 1 && rdLen == 4 {
-			ip := net.IPv4(resp[off], resp[off+1], resp[off+2], resp[off+3])
-			return ip, time.Duration(ttl) * time.Second, nil
-		}
-		off += int(rdLen)
+		ip := net.IPv4(a.A[0], a.A[1], a.A[2], a.A[3])
+		return ip, time.Duration(ah.TTL) * time.Second, nil
 	}
 	return nil, 0, fmt.Errorf("no A record in dns response")
-}
-
-func skipDNSName(msg []byte, off int) (int, error) {
-	for {
-		if off >= len(msg) {
-			return 0, fmt.Errorf("dns name overflow")
-		}
-		b := msg[off]
-		if b == 0 {
-			return off + 1, nil
-		}
-		if b&0xC0 == 0xC0 {
-			if off+2 > len(msg) {
-				return 0, fmt.Errorf("dns name pointer overflow")
-			}
-			return off + 2, nil
-		}
-		if b&0xC0 != 0 {
-			return 0, fmt.Errorf("dns invalid label prefix 0x%02x", b)
-		}
-		off += 1 + int(b)
-	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -33,9 +34,7 @@ func main() {
 		return
 	}
 
-	if *localIP == "" {
-		*localIP = os.Getenv("INTERNAL_IP4_ADDRESS")
-	}
+	*localIP = cmp.Or(*localIP, os.Getenv("INTERNAL_IP4_ADDRESS"))
 	if *localIP == "" {
 		log.Fatal("[main] Internal IP address not set. Use -ip or run via openconnect.")
 	}
@@ -51,9 +50,7 @@ func main() {
 		dnsServers = strings.Fields(envDNS)
 	}
 
-	if *dnsDomain == "" {
-		*dnsDomain = os.Getenv("CISCO_DEF_DOMAIN")
-	}
+	*dnsDomain = cmp.Or(*dnsDomain, os.Getenv("CISCO_DEF_DOMAIN"))
 
 	listenAddr := "127.0.0.1:" + *socksPort
 
@@ -84,8 +81,26 @@ func main() {
 		log.Fatalf("[main] SOCKS5 listen failed: %v", err)
 	}
 
-	ctx, ctxCancel := context.WithCancel(context.Background())
+	// signal.NotifyContext 把 SIGINT/SIGTERM/SIGHUP 直接挂到 ctx 上：信号一来
+	// ctx 自动 cancel，传到 ns.Run / server.Serve 内的 select case <-ctx.Done()。
+	// 比手写 signal.Notify + goroutine + select 少一坨 boilerplate。
+	// SIGUSR1 不是 shutdown 而是 dump stats，仍然单独处理。
+	ctx, ctxCancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer ctxCancel()
+
+	statsCh := make(chan os.Signal, 1)
+	signal.Notify(statsCh, syscall.SIGUSR1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-statsCh:
+				server.DumpStats()
+			}
+		}
+	}()
 
 	go func() {
 		if err := server.Serve(ctx); err != nil {
@@ -118,29 +133,12 @@ func main() {
 		output = os.Stdout
 	}
 
-	shutdownCh := make(chan os.Signal, 1)
-	signal.Notify(shutdownCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	statsCh := make(chan os.Signal, 1)
-	signal.Notify(statsCh, syscall.SIGUSR1)
-
-	go func() {
-		for {
-			select {
-			case sig := <-shutdownCh:
-				log.Printf("[main] received %v, shutting down gracefully...", sig)
-				ctxCancel()
-				server.Close(5 * time.Second)
-				return
-			case <-statsCh:
-				server.DumpStats()
-			}
-		}
-	}()
-
-	if err := ns.Run(ctx, input, output); err != nil {
-		if !isCleanShutdownErr(err) {
-			log.Printf("[main] netstack error: %v", err)
-		}
+	runErr := ns.Run(ctx, input, output)
+	log.Printf("[main] netstack exited, shutting down...")
+	ctxCancel()
+	server.Close(5 * time.Second)
+	if runErr != nil && !isCleanShutdownErr(runErr) {
+		log.Printf("[main] netstack error: %v", runErr)
 	}
 	log.Printf("[main] shutdown complete")
 }

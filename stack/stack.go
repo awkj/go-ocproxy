@@ -1,6 +1,7 @@
 package stack
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -75,9 +76,13 @@ func (ns *NetStack) DialTCP(ctx context.Context, addr *tcpip.FullAddress) (net.C
 
 	ep.SocketOptions().SetKeepAlive(true)
 	idle := tcpip.KeepaliveIdleOption(ns.TCPKeepalive)
-	ep.SetSockOpt(&idle)
+	if e := ep.SetSockOpt(&idle); e != nil {
+		log.Printf("[stack] set keepalive idle failed: %v", e)
+	}
 	intvl := tcpip.KeepaliveIntervalOption(ns.TCPKeepalive)
-	ep.SetSockOpt(&intvl)
+	if e := ep.SetSockOpt(&intvl); e != nil {
+		log.Printf("[stack] set keepalive interval failed: %v", e)
+	}
 
 	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
 	wq.EventRegister(&waitEntry)
@@ -131,10 +136,12 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 	}
 	defer inputConn.Close()
 
-	go func() {
-		<-innerCtx.Done()
+	// context.AfterFunc (Go 1.21) 替代专门起一个 goroutine 等 ctx.Done。
+	// 行为等价但少一条 goroutine，且 stop() 能保证函数最多执行一次。
+	stopDeadline := context.AfterFunc(innerCtx, func() {
 		inputConn.SetReadDeadline(time.Now())
-	}()
+	})
+	defer stopDeadline()
 
 	rawOutput, err := output.SyscallConn()
 	if err != nil {
@@ -223,7 +230,9 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 				if probeErr == nil {
 					continue
 				}
-				if probeErr == syscall.ENOTCONN || probeErr == syscall.ECONNREFUSED || probeErr == syscall.EBADF {
+				if errors.Is(probeErr, syscall.ENOTCONN) ||
+					errors.Is(probeErr, syscall.ECONNREFUSED) ||
+					errors.Is(probeErr, syscall.EBADF) {
 					log.Printf("[health] vpn health check failed: %v", probeErr)
 					errCh <- fmt.Errorf("vpn health check failed: %w", probeErr)
 					cancel()
@@ -249,8 +258,12 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 		if n < 20 {
 			continue
 		}
-		data := make([]byte, n)
-		copy(data, pktBuf[:n])
+		// 只接收 IPv4。VPN 偶发的 IPv6/其他协议族包丢弃，避免给只注册了 ipv4
+		// 协议的 stack 喂错版本的报文，省掉一次无效 InjectInbound 的 alloc/解析。
+		if pktBuf[0]>>4 != 4 {
+			continue
+		}
+		data := bytes.Clone(pktBuf[:n])
 		pk := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(data),
 		})

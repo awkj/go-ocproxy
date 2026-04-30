@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/awkj/go-ocproxy/stack"
@@ -195,23 +196,23 @@ func TestBuildDNSQueryInvalidLabel(t *testing.T) {
 func TestParseDNSResponse(t *testing.T) {
 	// 构造一个最小的 DNS A 记录响应
 	resp := make([]byte, 0, 64)
-	resp = binary.BigEndian.AppendUint16(resp, 0xABCD)    // ID
-	resp = binary.BigEndian.AppendUint16(resp, 0x8180)    // Flags: response, no error
-	resp = binary.BigEndian.AppendUint16(resp, 1)         // QDCOUNT
-	resp = binary.BigEndian.AppendUint16(resp, 1)         // ANCOUNT
-	resp = binary.BigEndian.AppendUint16(resp, 0)         // NSCOUNT
-	resp = binary.BigEndian.AppendUint16(resp, 0)         // ARCOUNT
+	resp = binary.BigEndian.AppendUint16(resp, 0xABCD) // ID
+	resp = binary.BigEndian.AppendUint16(resp, 0x8180) // Flags: response, no error
+	resp = binary.BigEndian.AppendUint16(resp, 1)      // QDCOUNT
+	resp = binary.BigEndian.AppendUint16(resp, 1)      // ANCOUNT
+	resp = binary.BigEndian.AppendUint16(resp, 0)      // NSCOUNT
+	resp = binary.BigEndian.AppendUint16(resp, 0)      // ARCOUNT
 	// Question: www.example.com A IN
 	resp = append(resp, 3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0)
 	resp = binary.BigEndian.AppendUint16(resp, 1) // QTYPE=A
 	resp = binary.BigEndian.AppendUint16(resp, 1) // QCLASS=IN
 	// Answer: compressed name pointer to offset 12
-	resp = append(resp, 0xC0, 0x0C)               // name pointer
-	resp = binary.BigEndian.AppendUint16(resp, 1)  // TYPE=A
-	resp = binary.BigEndian.AppendUint16(resp, 1)  // CLASS=IN
+	resp = append(resp, 0xC0, 0x0C)                 // name pointer
+	resp = binary.BigEndian.AppendUint16(resp, 1)   // TYPE=A
+	resp = binary.BigEndian.AppendUint16(resp, 1)   // CLASS=IN
 	resp = binary.BigEndian.AppendUint32(resp, 300) // TTL=300s
-	resp = binary.BigEndian.AppendUint16(resp, 4)  // RDLENGTH=4
-	resp = append(resp, 93, 184, 216, 34)          // 93.184.216.34
+	resp = binary.BigEndian.AppendUint16(resp, 4)   // RDLENGTH=4
+	resp = append(resp, 93, 184, 216, 34)           // 93.184.216.34
 
 	ip, ttl, err := parseDNSResponse(resp, 0xABCD)
 	if err != nil {
@@ -244,28 +245,9 @@ func TestParseDNSResponseRcode(t *testing.T) {
 	}
 }
 
-func TestSkipDNSName(t *testing.T) {
-	// "www.example.com" encoded
-	msg := []byte{3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}
-	off, err := skipDNSName(msg, 0)
-	if err != nil {
-		t.Fatalf("skipDNSName: %v", err)
-	}
-	if off != len(msg) {
-		t.Errorf("offset = %d, want %d", off, len(msg))
-	}
-}
-
-func TestSkipDNSNameCompression(t *testing.T) {
-	msg := []byte{0xC0, 0x0C} // compression pointer
-	off, err := skipDNSName(msg, 0)
-	if err != nil {
-		t.Fatalf("skipDNSName: %v", err)
-	}
-	if off != 2 {
-		t.Errorf("offset = %d, want 2", off)
-	}
-}
+// 注：之前的 skipDNSName 单元测试已删除——name compression / 边界检查现在
+// 由 golang.org/x/net/dns/dnsmessage 内部处理，测它的内部状态机意义不大；
+// TestParseDNSResponse 用一个真实的 compressed-pointer 响应做端到端验证。
 
 // ===========================================================================
 // Stats (SPEC §2.6)
@@ -572,4 +554,59 @@ func TestDumpStats(t *testing.T) {
 	s.Stats.connOpened()
 	s.Stats.DNSCacheHit.Add(10)
 	s.DumpStats() // 不 panic 就 pass
+}
+
+// ===========================================================================
+// cacheCleanupLoop — 用 testing/synctest（Go 1.25 stable）测周期触发
+// ===========================================================================
+//
+// 不用 synctest 的话要么 sleep 60s 真等（拖慢 CI），要么把 dnsCacheCleanupInterval
+// 拆成可注入参数（污染生产代码 API）。synctest 在虚拟时钟里跑：time.Sleep 不实际
+// 阻塞，而是推进 bubble 的虚拟时间，所有等待都瞬间结算。
+//
+// 限制：bubble 内只能有 synctest-aware 的等待原语（time/channel/sync），不能有
+// 真实 syscall 或网络 I/O。所以这里特意构造一个**没有 NetStack** 的 Server——
+// cacheCleanupLoop 只依赖 s.cache，刚好不碰外部资源。
+func TestCacheCleanupLoop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &Server{cache: newDNSCache()}
+
+		// 预填两个条目：一个早就过期，一个还活着
+		s.cache.mu.Lock()
+		s.cache.entries["expired"] = dnsCacheEntry{
+			ip:     net.IPv4(1, 1, 1, 1),
+			expiry: time.Now().Add(-time.Hour),
+		}
+		s.cache.entries["alive"] = dnsCacheEntry{
+			ip:     net.IPv4(2, 2, 2, 2),
+			expiry: time.Now().Add(time.Hour),
+		}
+		s.cache.mu.Unlock()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			s.cacheCleanupLoop(ctx)
+			close(done)
+		}()
+
+		// 推进虚拟时钟超过一个 cleanup interval（60s）。Sleep 不真睡：
+		// 当 bubble 内所有 goroutine durably blocked 后立刻 fast-forward。
+		time.Sleep(dnsCacheCleanupInterval + time.Second)
+		synctest.Wait()
+
+		if size := s.cache.size(); size != 1 {
+			t.Errorf("expected 1 alive entry after cleanup, got %d", size)
+		}
+		if _, ok, _ := s.cache.get("alive"); !ok {
+			t.Error("alive entry should survive cleanup")
+		}
+		if _, ok, _ := s.cache.get("expired"); ok {
+			t.Error("expired entry should be evicted")
+		}
+
+		// synctest.Test 要求 f 返回前所有 bubble 内 goroutine 都已退出
+		cancel()
+		<-done
+	})
 }

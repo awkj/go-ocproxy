@@ -2,7 +2,10 @@ module github.com/awkj/go-ocproxy
 
 go 1.26
 
-require gvisor.dev/gvisor v0.0.0-20260416192914-3278e925778d
+require (
+	golang.org/x/net v0.53.0
+	gvisor.dev/gvisor v0.0.0-20260416192914-3278e925778d
+)
 
 require (
 	github.com/google/btree v1.1.3 // indirect
