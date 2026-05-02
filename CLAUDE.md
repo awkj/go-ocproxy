@@ -152,6 +152,29 @@ go build -trimpath -ldflags="-s -w" -o go-ocproxy
 
 `-trimpath` 去掉编译机绝对路径（可重现构建）；`-ldflags="-s -w"` 剥符号表 + DWARF，gVisor 依赖很大，体积可降 25–30%。
 
+## 升级 gvisor 依赖（**踩过坑**）
+
+gvisor 是 bazel 项目，**master 分支的源码无法直接被 `go build` 使用**：
+- 大量 `*_mutex.go` / `*_refs.go` / `*_state_autogen.go` 是 bazel 从 `.tmpl` 模板生成的，git 不入库
+- 部分 `_test.go`（如 `pkg/tcpip/stack/bridge_test.go`）用了 `package bridge_test` 这种声明，bazel 当独立 build target 没问题，但违反 Go 目录-包规则（同目录主包是 `stack`，外部测试包必须叫 `stack_test`），`go build` 直接报 `found packages stack and bridge in ...`
+
+gvisor 团队为此维护了一个独立的 `go` 分支：bazel 跑完代码生成、剥掉 `_test.go` 和 `BUILD` 文件之后 push 上去专供 Go module 用户。
+
+**所以不要用 `go get -u gvisor.dev/gvisor`** —— 它会从 master 拿最新 commit 然后炸。正确做法：
+
+```bash
+# 1. 拿 go 分支最新 commit hash
+GVISOR_COMMIT=$(curl -s "https://api.github.com/repos/google/gvisor/branches/go" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['commit']['sha'][:12])")
+
+# 2. 显式指定 commit 升级
+go get gvisor.dev/gvisor@$GVISOR_COMMIT
+go mod tidy
+
+# 3. 验证拉到的是 go 分支的 zip：应有 *_mutex.go，没有 _test.go / BUILD
+ls $(go env GOMODCACHE)/gvisor.dev/gvisor@*/pkg/tcpip/stack/ | grep -E '_mutex\.go|_test\.go|^BUILD$'
+```
+
 ## 提交规范
 
 - 中文 commit message OK，建议 `<type>: <subject>`，type 用 `fix` / `feat` / `refactor` / `docs` / `test` / `chore`

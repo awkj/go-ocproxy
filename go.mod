@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	golang.org/x/net v0.53.0
-	gvisor.dev/gvisor v0.0.0-20260416192914-3278e925778d
+	gvisor.dev/gvisor v0.0.0-20260501174236-38fac1bddd3c
 )
 
 require (

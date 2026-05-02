@@ -8,5 +8,5 @@ golang.org/x/sys v0.43.0 h1:Rlag2XtaFTxp19wS8MXlJwTvoh8ArU6ezoyFsMyCTNI=
 golang.org/x/sys v0.43.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
 golang.org/x/time v0.15.0 h1:bbrp8t3bGUeFOx08pvsMYRTCVSMk89u4tKbNOZbp88U=
 golang.org/x/time v0.15.0/go.mod h1:Y4YMaQmXwGQZoFaVFk4YpCt4FLQMYKZe9oeV/f4MSno=
-gvisor.dev/gvisor v0.0.0-20260416192914-3278e925778d h1:fOinhGf1KGDp6xf7FKbWuxAFJRdeBZVFlS2TYKgcSKY=
-gvisor.dev/gvisor v0.0.0-20260416192914-3278e925778d/go.mod h1:xQ2PWgHmWJA/Ph4i1q1jBm39BKhc3W0DXqWoDSyuBOY=
+gvisor.dev/gvisor v0.0.0-20260501174236-38fac1bddd3c h1:nUZeBYQ1vntKyh+GQXRkAhIaGtool8cy/DfY27T34pg=
+gvisor.dev/gvisor v0.0.0-20260501174236-38fac1bddd3c/go.mod h1:xQ2PWgHmWJA/Ph4i1q1jBm39BKhc3W0DXqWoDSyuBOY=
