@@ -5,11 +5,58 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// scriptedConn 是按脚本返回 Write 错误的 net.Conn mock，用于精确测试
+// writeOutboundWithRetry 在各种错误序列下的行为。脚本耗尽后默认成功。
+type scriptedConn struct {
+	net.Conn // embed nil：未脚本化的方法被调用直接 panic，定位测试漏洞
+
+	mu      sync.Mutex
+	results []error // 第 i 次 Write 返回 results[i]；nil 表示成功
+	calls   int
+}
+
+func (c *scriptedConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx := c.calls
+	c.calls++
+	if idx >= len(c.results) {
+		return len(b), nil
+	}
+	if err := c.results[idx]; err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (c *scriptedConn) Calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// withFastRetry 把退避参数缩到测试友好的范围（10 次合计 < 1ms），返回还原函数。
+func withFastRetry(t *testing.T) func() {
+	t.Helper()
+	origMax := outboundMaxRetries
+	origInit := outboundInitialDelay
+	origMaxDelay := outboundMaxDelay
+	outboundInitialDelay = 0
+	outboundMaxDelay = 0
+	return func() {
+		outboundMaxRetries = origMax
+		outboundInitialDelay = origInit
+		outboundMaxDelay = origMaxDelay
+	}
+}
 
 func TestIsFatalWriteErr(t *testing.T) {
 	cases := []struct {
@@ -196,6 +243,131 @@ func TestRunOutboundFatalNotifiesMainLoop(t *testing.T) {
 		t.Logf("Run returned: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return within 5s")
+	}
+}
+
+// W-RETRY-1: 第一次 Write 成功，不重试
+func TestWriteOutboundWithRetry_Success(t *testing.T) {
+	defer withFastRetry(t)()
+	conn := &scriptedConn{results: []error{nil}}
+	if err := writeOutboundWithRetry(context.Background(), conn, []byte("x")); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if c := conn.Calls(); c != 1 {
+		t.Errorf("expected 1 Write, got %d", c)
+	}
+}
+
+// W-RETRY-2: ENOBUFS 几次后成功，最终返回 nil
+func TestWriteOutboundWithRetry_TransientThenSuccess(t *testing.T) {
+	defer withFastRetry(t)()
+	conn := &scriptedConn{results: []error{
+		syscall.ENOBUFS,
+		syscall.ENOBUFS,
+		syscall.ENOBUFS,
+		nil,
+	}}
+	if err := writeOutboundWithRetry(context.Background(), conn, []byte("x")); err != nil {
+		t.Fatalf("expected nil after retries, got %v", err)
+	}
+	if c := conn.Calls(); c != 4 {
+		t.Errorf("expected 4 Write calls, got %d", c)
+	}
+}
+
+// W-RETRY-3: ENOBUFS 持续返回耗尽重试上限，错误回传给调用方（由调用方决定丢包）
+func TestWriteOutboundWithRetry_TransientExhausted(t *testing.T) {
+	defer withFastRetry(t)()
+	outboundMaxRetries = 5 // 测试覆盖
+	conn := &scriptedConn{results: []error{
+		syscall.ENOBUFS, syscall.ENOBUFS, syscall.ENOBUFS,
+		syscall.ENOBUFS, syscall.ENOBUFS,
+	}}
+	err := writeOutboundWithRetry(context.Background(), conn, []byte("x"))
+	if !errors.Is(err, syscall.ENOBUFS) {
+		t.Fatalf("expected ENOBUFS after exhaust, got %v", err)
+	}
+	if c := conn.Calls(); c != 5 {
+		t.Errorf("expected 5 Write calls (= maxRetries), got %d", c)
+	}
+}
+
+// W-RETRY-4: fatal 错误立即返回，不重试（避免 ENOBUFS-style 退避后才发现连接死了）
+func TestWriteOutboundWithRetry_FatalImmediate(t *testing.T) {
+	defer withFastRetry(t)()
+	cases := []error{
+		syscall.EPIPE, syscall.EBADF, syscall.ECONNRESET,
+		syscall.ENOTCONN, io.ErrClosedPipe, os.ErrClosed,
+	}
+	for _, fatal := range cases {
+		t.Run(fatal.Error(), func(t *testing.T) {
+			conn := &scriptedConn{results: []error{fatal, nil}}
+			err := writeOutboundWithRetry(context.Background(), conn, []byte("x"))
+			if !errors.Is(err, fatal) {
+				t.Fatalf("expected %v, got %v", fatal, err)
+			}
+			if c := conn.Calls(); c != 1 {
+				t.Errorf("expected 1 Write call (no retry), got %d", c)
+			}
+		})
+	}
+}
+
+// W-RETRY-5: ctx 在退避中被取消，立即返回 ctx.Err()
+func TestWriteOutboundWithRetry_ContextCancel(t *testing.T) {
+	// 这个测试需要真实退避才能让 ctx 在 sleep 时被取消，所以不用 withFastRetry
+	origInit := outboundInitialDelay
+	outboundInitialDelay = 50 * time.Millisecond
+	defer func() { outboundInitialDelay = origInit }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := &scriptedConn{results: []error{
+		syscall.ENOBUFS, syscall.ENOBUFS, syscall.ENOBUFS,
+	}}
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err := writeOutboundWithRetry(ctx, conn, []byte("x"))
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	// 应该在 ~10ms 退出，远短于 maxRetries × 50ms = 500ms。给宽容一点
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("expected fast cancel (<200ms), took %v", elapsed)
+	}
+}
+
+// W-RETRY-6: ErrDeadlineExceeded 立即返回（ctx cancel 通过 SetDeadline 传导，不应被
+// 当成 transient 重试，否则下游 Run 收不到退出信号）
+func TestWriteOutboundWithRetry_DeadlineExceededImmediate(t *testing.T) {
+	defer withFastRetry(t)()
+	conn := &scriptedConn{results: []error{os.ErrDeadlineExceeded, nil}}
+	err := writeOutboundWithRetry(context.Background(), conn, []byte("x"))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected ErrDeadlineExceeded, got %v", err)
+	}
+	if c := conn.Calls(); c != 1 {
+		t.Errorf("expected 1 Write call, got %d", c)
+	}
+}
+
+// W-RETRY-7: maxRetries=0 退化为不写（防御性边界）
+func TestWriteOutboundWithRetry_ZeroRetries(t *testing.T) {
+	defer withFastRetry(t)()
+	outboundMaxRetries = 0
+	conn := &scriptedConn{}
+	err := writeOutboundWithRetry(context.Background(), conn, []byte("x"))
+	if err != nil {
+		t.Fatalf("expected nil (no attempts made), got %v", err)
+	}
+	if c := conn.Calls(); c != 0 {
+		t.Errorf("expected 0 Write calls, got %d", c)
 	}
 }
 

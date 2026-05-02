@@ -24,7 +24,7 @@
 - [x] **稳定流处理**：精确的 IP 数据包边界处理，确保长连接稳定性。
 
 ## 🛠️ 编译
-需要 Go 1.21 或更高版本。
+需要 Go 1.25 或更高版本。
 ```bash
 cd go-ocproxy
 go build -o go-ocproxy
@@ -42,9 +42,18 @@ sudo openconnect \
 ### 命令行参数
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
-| `-socks` | SOCKS5 服务监听地址 | `127.0.0.1:1080` |
+| `-D` | SOCKS5 监听端口 | `1080` |
 | `-ip` | 手动指定内部 IPv4 地址（通常自动获取） | 无 |
 | `-mtu` | 手动指定 MTU 大小（通常自动获取） | `1500` |
+| `-o` | 默认 DNS 域名后缀（CISCO_DEF_DOMAIN） | 无 |
+| `-k` | TCP keepalive 间隔（秒，0=禁用） | `0` |
+| `-V` | 显示版本号 | – |
+
+## 📚 给开发者 / 贡献者
+
+- **行为契约和测试矩阵**：[SPEC.md](SPEC.md)
+- **架构、踩坑笔记、贡献指南**：[CLAUDE.md](CLAUDE.md) —— 改 fd / 网络栈代码**之前必读**
+- **版本变更记录**：[docs/CHANGELOG.md](docs/CHANGELOG.md)
 
 ---
 *Created with ❤️ by Gemini CLI.*

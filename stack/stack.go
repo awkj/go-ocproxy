@@ -128,35 +128,68 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 
 	errCh := make(chan error, 2)
 
-	// net.FileConn 将 fd 正确注册到 Go poller，使 SetReadDeadline 可靠工作。
-	// 注意：FileConn 会 dup fd，需单独关闭。
-	inputConn, err := net.FileConn(input)
-	if err != nil {
-		return fmt.Errorf("convert input to conn: %w", err)
+	// 调大 VPN socketpair 这一端的 SNDBUF/RCVBUF。
+	// 必须在 net.FileConn 之前操作原始 fd：FileConn dup fd 后会把它设成
+	// O_NONBLOCK，配合较小的默认 buffer，高吞吐上传时一灌就满直接 EAGAIN。
+	// macOS 默认 SO_SNDBUF 对 AF_UNIX SOCK_DGRAM 通常只有 8K 量级，调大到 1MB
+	// 大幅减少 net.Conn.Write 因 buffer 满而挂起 goroutine 的概率。
+	if rawIn, e := input.SyscallConn(); e == nil {
+		const bufSize = 1 << 20 // 1 MiB
+		_ = rawIn.Control(func(fd uintptr) {
+			if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, bufSize); err != nil {
+				log.Printf("[stack] set SO_SNDBUF=%d failed: %v", bufSize, err)
+			}
+			if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, bufSize); err != nil {
+				log.Printf("[stack] set SO_RCVBUF=%d failed: %v", bufSize, err)
+			}
+		})
 	}
-	defer inputConn.Close()
+
+	// net.FileConn 将 fd 正确注册到 Go poller，使 SetReadDeadline / Write 阻塞
+	// 重试可靠工作。注意：FileConn 会 dup fd 并把它设为 O_NONBLOCK，需单独关闭。
+	//
+	// input 和 output 是 openconnect socketpair 的同一端（同一 *os.File），
+	// 共用一个 net.Conn 既读又写即可：net.Conn.Write 在 fd 不可写（EAGAIN）时
+	// 会挂起 goroutine 等到可写而不是丢包，这是修复上传卡死的关键——之前用
+	// output.Write（裸 *os.File）时，由于 FileConn dup 共享了 file description，
+	// 原 fd 也变成非阻塞，buffer 满直接 EAGAIN，包被静默丢弃。
+	vpnConn, err := net.FileConn(input)
+	if err != nil {
+		return fmt.Errorf("convert vpn fd to conn: %w", err)
+	}
+	defer vpnConn.Close()
 
 	// context.AfterFunc (Go 1.21) 替代专门起一个 goroutine 等 ctx.Done。
 	// 行为等价但少一条 goroutine，且 stop() 能保证函数最多执行一次。
+	// SetDeadline 同时打断阻塞中的 Read 和 Write。
 	stopDeadline := context.AfterFunc(innerCtx, func() {
-		inputConn.SetReadDeadline(time.Now())
+		vpnConn.SetDeadline(time.Now())
 	})
 	defer stopDeadline()
 
+	// 健康检查仍用原 *os.File 的 SyscallConn 做 getpeername 探测；fd 与 vpnConn
+	// 共享底层 file description，对原 fd 调 syscall 等价于对 vpnConn 调。
 	rawOutput, err := output.SyscallConn()
 	if err != nil {
 		return fmt.Errorf("get raw output conn: %w", err)
 	}
 
 	// Outbound: gVisor -> VPN
+	//
+	// 错误处理策略：
+	//   - fatal（EPIPE/ECONNRESET/EBADF/ENOTCONN 等连接死亡）→ 退出 goroutine
+	//   - ctx 取消触发的 ErrDeadlineExceeded → 静默退出
+	//   - transient（主要是 ENOBUFS：macOS AF_UNIX SOCK_DGRAM 在高流量下系统
+	//     mbuf 池暂时耗尽）→ backoff 重试同一个包。Go runtime poller 会自动
+	//     重试 EAGAIN，但不会重试 ENOBUFS，必须我们自己退避后重试。
+	//
+	// 不能像旧版本那样静默丢包：丢包会触发 gVisor TCP 重传，但底层 buffer
+	// 仍然紧张，重传也丢，连接事实停滞——这正是上传卡死的根因。
 	go func() {
 		defer cancel()
 
-		// transient 错误（EAGAIN / ENOBUFS 等）按秒聚合：避免 VPN 抖动时每丢一个
-		// 包打一行日志把屏幕刷爆。这里把计数和上次打印时间放在循环本地变量里，
-		// 全部由本 goroutine 读写，无数据竞争。
-		var droppedSinceLast int
-		var lastDropErr error
+		var transientSinceLast int
+		var lastTransientErr error
 		lastLogAt := time.Now()
 
 		for {
@@ -168,35 +201,32 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 			// 的引用计数完全是两码事，不能混淆。
 			pkt := ns.Link.ReadContext(innerCtx)
 			if pkt == nil {
-				// 退出前若还有累计的丢包，flush 一行日志免得静默丢失信息
-				if droppedSinceLast > 0 {
-					log.Printf("[stack] outbound dropped %d pkt before exit (last err: %v)",
-						droppedSinceLast, lastDropErr)
-				}
 				return
 			}
 			buf := pkt.ToBuffer()
-			_, err := output.Write(buf.Flatten())
+			data := buf.Flatten()
 			buf.Release()
 			pkt.DecRef()
 
-			if err == nil {
-				continue
-			}
-			if isFatalWriteErr(err) {
-				log.Printf("[stack] outbound write fatal, exiting: %v", err)
-				errCh <- fmt.Errorf("outbound write fatal: %w", err)
-				return
-			}
-			// transient：累计计数；每秒最多打一行
-			droppedSinceLast++
-			lastDropErr = err
-			if time.Since(lastLogAt) >= time.Second {
-				log.Printf("[stack] outbound dropped %d pkt in last %v (last err: %v)",
-					droppedSinceLast, time.Since(lastLogAt).Round(time.Millisecond), lastDropErr)
-				droppedSinceLast = 0
-				lastDropErr = nil
-				lastLogAt = time.Now()
+			if err := writeOutboundWithRetry(innerCtx, vpnConn, data); err != nil {
+				if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.Canceled) {
+					return
+				}
+				if isFatalWriteErr(err) {
+					log.Printf("[stack] outbound write fatal, exiting: %v", err)
+					errCh <- fmt.Errorf("outbound write fatal: %w", err)
+					return
+				}
+				// 非 fatal 但重试上限耗尽：丢这一个包，不退出。每秒最多打一行。
+				transientSinceLast++
+				lastTransientErr = err
+				if time.Since(lastLogAt) >= time.Second {
+					log.Printf("[stack] outbound dropped %d pkt in last %v after retries (last err: %v)",
+						transientSinceLast, time.Since(lastLogAt).Round(time.Millisecond), lastTransientErr)
+					transientSinceLast = 0
+					lastTransientErr = nil
+					lastLogAt = time.Now()
+				}
 			}
 		}
 	}()
@@ -245,7 +275,7 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 	// Inbound: VPN -> gVisor
 	pktBuf := make([]byte, 65535)
 	for {
-		n, err := inputConn.Read(pktBuf)
+		n, err := vpnConn.Read(pktBuf)
 		if err != nil {
 			cancel()
 			select {
@@ -274,6 +304,54 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 		// 入站吞吐通常远大于出站（下载场景），这条泄漏比出站更致命。
 		pk.DecRef()
 	}
+}
+
+// writeOutboundWithRetry 写一个 IP 包到 VPN 连接，遇到 transient 错误
+// （非 fatal 且非 ctx 取消，主要是 ENOBUFS）时按指数退避重试。
+//
+// 为什么需要：macOS AF_UNIX SOCK_DGRAM 在大流量上传时，系统 mbuf 池可能
+// 暂时耗尽，sendto() 返回 ENOBUFS。Go runtime poller 会自动重试 EAGAIN
+// 但不会重试 ENOBUFS——它会原样返回这个错误。如果调用方把 ENOBUFS 当
+// fatal 退出，整条 SOCKS5 服务就会在大文件上传后挂掉；如果当 transient
+// 静默丢包，又会触发 TCP 反复重传陷入卡死。正确的处理是短暂退避后重试
+// 同一个包，给系统一点时间释放 mbuf。
+//
+// 重试策略：1ms / 2ms / 4ms / ... 上限 32ms，最多 10 次（累计约 191ms）。
+// 超过仍失败则把错误返回给调用方，由调用方决定丢包还是退出。
+//
+// 这几个参数提成包级变量是为了测试能临时覆盖，免得单测真睡 200ms。
+var (
+	outboundMaxRetries   = 10
+	outboundInitialDelay = 1 * time.Millisecond
+	outboundMaxDelay     = 32 * time.Millisecond
+)
+
+func writeOutboundWithRetry(ctx context.Context, conn net.Conn, data []byte) error {
+	delay := outboundInitialDelay
+
+	var err error
+	for range outboundMaxRetries {
+		_, err = conn.Write(data)
+		if err == nil {
+			return nil
+		}
+		if isFatalWriteErr(err) || errors.Is(err, os.ErrDeadlineExceeded) {
+			return err
+		}
+		// transient（ENOBUFS 等）：退避重试
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < outboundMaxDelay {
+			delay *= 2
+			if delay > outboundMaxDelay {
+				delay = outboundMaxDelay
+			}
+		}
+	}
+	return err
 }
 
 func isFatalWriteErr(err error) bool {

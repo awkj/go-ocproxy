@@ -24,7 +24,7 @@ The original `ocproxy` is written in C and carries roughly 80,000 lines of code,
 - [x] **Packet Boundary Logic**: Robust handling of IP packet streams for stable long-lived connections.
 
 ## 🛠️ Build
-Requires Go 1.21+.
+Requires Go 1.25+.
 ```bash
 cd go-ocproxy
 go build -o go-ocproxy
@@ -42,9 +42,18 @@ sudo openconnect \
 ### CLI Arguments
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `-socks` | SOCKS5 listen address | `127.0.0.1:1080` |
+| `-D` | SOCKS5 listen port | `1080` |
 | `-ip` | Manually specify internal IPv4 address (usually auto-detected) | None |
 | `-mtu` | Manually specify MTU (usually auto-detected) | `1500` |
+| `-o` | Default DNS domain suffix (CISCO_DEF_DOMAIN) | None |
+| `-k` | TCP keepalive interval in seconds (0=disabled) | `0` |
+| `-V` | Show version | – |
+
+## 📚 For Developers / Contributors
+
+- **Behavior contract & test matrix**: [SPEC.md](SPEC.md)
+- **Architecture, gotchas, contribution guide**: [CLAUDE.md](CLAUDE.md) — read this **before changing fd / netstack code**
+- **Version history**: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
 ---
 *Created with ❤️ by Gemini CLI.*
