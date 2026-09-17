@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- 更新全部 Go 依赖至当前版本，gVisor 使用 `go` 分支；编译基线升级为 Go 1.27.1。
+
 ### Fixed
 - Windows 新增通用 `VPN_UDP_PEER` 数据报 transport，供外部 libopenconnect helper
   通过 `openconnect_setup_tun_fd(HANDLE)` 接入，绕开上游 Windows CLI 不支持的

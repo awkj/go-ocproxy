@@ -25,7 +25,7 @@
 - [x] **稳定流处理**：精确的 IP 数据包边界处理，确保长连接稳定性。
 
 ## 🛠️ 编译
-需要最新稳定版 Go（当前为 Go 1.26.5）。
+需要最新稳定版 Go（当前为 Go 1.27.1）。
 ```bash
 cd go-ocproxy
 go build -o go-ocproxy

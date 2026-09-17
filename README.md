@@ -27,7 +27,7 @@ The original `ocproxy` is written in C and carries roughly 80,000 lines of code,
 - [x] **Packet Boundary Logic**: Robust handling of IP packet streams for stable long-lived connections.
 
 ## 🛠️ Build
-Requires the latest stable Go release (currently Go 1.26.5).
+Requires the latest stable Go release (currently Go 1.27.1).
 ```bash
 cd go-ocproxy
 go build -o go-ocproxy

@@ -156,7 +156,7 @@ go test ./... -race     # 数据竞争检测
 
 ## 构建
 
-始终使用最新稳定版 Go；当前基线是 Go 1.26.5。CI 使用 `go-version: stable`，`go.mod` 记录当前已验证的稳定补丁版本。
+始终使用最新稳定版 Go；当前基线是 Go 1.27.1。CI 使用 `go-version: stable`，`go.mod` 记录当前已验证的稳定补丁版本。
 
 ```bash
 go build -trimpath -ldflags="-s -w" -o go-ocproxy
