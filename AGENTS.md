@@ -193,6 +193,10 @@ ls $(go env GOMODCACHE)/gvisor.dev/gvisor@*/pkg/tcpip/stack/ | grep -E '_mutex\.
 
 ## 提交规范
 
+- 本仓库的 Agent 提交必须归属维护者 GitHub 账号 **awkj**；作者和提交者均使用
+  `awkj <9017743+awkj@users.noreply.github.com>`。提交前核对仓库 Git identity，
+  推送前用 `gh api user` 确认登录账号为 `awkj`，不得改用其他账号或混入自动化作者。
+
 - 中文 commit message OK，建议 `<type>: <subject>`，type 用 `fix` / `feat` / `refactor` / `docs` / `test` / `chore`
 - bug fix 必须**同时**：
   1. 在 `SPEC.md` 里写明（或更新）行为规格

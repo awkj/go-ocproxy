@@ -7,6 +7,8 @@
 - 更新全部 Go 依赖至当前版本，gVisor 使用 `go` 分支；编译基线升级为 Go 1.27.1。
 
 ### Fixed
+- 同一域名的并发 DNS cache miss 合并为一次在途查询；调用方独立取消，最后一个
+  等待者离开后中止查询。DNS UDP/TCP I/O 响应 context 取消，取消与超时不再污染负缓存。
 - Windows 新增通用 `VPN_UDP_PEER` 数据报 transport，供外部 libopenconnect helper
   通过 `openconnect_setup_tun_fd(HANDLE)` 接入，绕开上游 Windows CLI 不支持的
   `--script-tun`；必需的随机 `VPN_UDP_TOKEN` 用于防止本机进程抢先注入握手。
@@ -41,6 +43,8 @@
 - 新增 `AGENTS.md`，给 AI 开发助手 / 长期维护者的项目背景、架构和坑位文档。
 
 ### Changed
+- 双向转发字节统计使用独立局部计数器，并通过 `WaitGroup.Wait` 同步结果，去掉不必要
+  的原子操作；并发安全由 race 回归测试验证。
 - 出向 goroutine 不再使用裸 `*os.File.Write`，统一通过 `net.Conn.Write` 写 VPN fd。
 - input/output 不再各自 `net.FileConn` dup 一次，复用同一个 `vpnConn`；`SetDeadline`
   同时打断阻塞的 Read 和 Write。

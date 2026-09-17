@@ -176,6 +176,7 @@ type Server struct {
 	dnsServers []string
 	dnsDomain  string
 	cache      *dnsCache
+	dnsLookups dnsLookupGroup
 	Stats      Stats
 	connLimit  chan struct{}
 	listener   net.Listener

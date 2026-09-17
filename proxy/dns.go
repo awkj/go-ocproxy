@@ -31,6 +31,22 @@ func (s *Server) resolve(ctx context.Context, name string) (net.IP, error) {
 		return ip, nil
 	}
 	s.Stats.DNSCacheMiss.Add(1)
+	return s.dnsLookups.do(ctx, name, func(queryCtx context.Context) (net.IP, error) {
+		return s.resolveUncached(queryCtx, name)
+	})
+}
+
+func (s *Server) resolveUncached(ctx context.Context, name string) (net.IP, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Another flight may have completed between the first cache read and joining.
+	if ip, found, negative := s.cache.get(name); found {
+		if negative {
+			return nil, fmt.Errorf("negative cache hit for %s", name)
+		}
+		return ip, nil
+	}
 
 	var ip net.IP
 	var ttl time.Duration
@@ -53,16 +69,30 @@ func (s *Server) resolve(ctx context.Context, name string) (net.IP, error) {
 		ip, ttl, err = s.queryDNS(ctx, name)
 	}
 
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		// 写入负缓存：5s 内同一域名再来也直接失败，不打 DNS
-		s.cache.setNegative(name)
+		if cacheableDNSFailure(err) {
+			s.cache.setNegative(name)
+		}
 		return nil, err
 	}
 	s.cache.set(name, ip, ttl)
 	return ip, nil
 }
 
+func cacheableDNSFailure(err error) bool {
+	var networkError net.Error
+	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
+		!(errors.As(err, &networkError) && networkError.Timeout())
+}
+
 func (s *Server) queryDNS(ctx context.Context, name string) (net.IP, time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	if len(s.dnsServers) == 0 {
 		addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", name)
 		if err != nil {
@@ -88,6 +118,9 @@ func (s *Server) queryDNS(ctx context.Context, name string) (net.IP, time.Durati
 	start := rand.IntN(len(s.dnsServers))
 	var lastErr error
 	for i := range dnsMaxAttempts {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
 		server := s.dnsServers[(start+i)%len(s.dnsServers)]
 		ip, ttl, err := s.dnsQueryType(ctx, name, server, dnsmessage.TypeA)
 		if err == nil && ip != nil {
@@ -105,6 +138,9 @@ func (s *Server) queryDNS(ctx context.Context, name string) (net.IP, time.Durati
 	if s.ns.HasIPv6 {
 		start = rand.IntN(len(s.dnsServers))
 		for i := range dnsMaxAttempts {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
 			server := s.dnsServers[(start+i)%len(s.dnsServers)]
 			ip, ttl, err := s.dnsQueryType(ctx, name, server, dnsmessage.TypeAAAA)
 			if err == nil && ip != nil {
@@ -173,6 +209,9 @@ func (s *Server) dnsQueryType(ctx context.Context, name, server string, qtype dn
 	}
 
 	resp, truncated, udpErr := s.queryUDP(ctx, addr, query)
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	if udpErr == nil && !truncated {
 		return parseDNSResponse(resp, id)
 	}
@@ -197,7 +236,10 @@ func (s *Server) queryUDP(ctx context.Context, addr *tcpip.FullAddress, query []
 		return nil, false, err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(dnsUDPTimeout))
+	deadline, _ := dialCtx.Deadline()
+	conn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(dialCtx, func() { conn.SetDeadline(time.Now()) })
+	defer stopCancel()
 
 	if _, err := conn.Write(query); err != nil {
 		return nil, false, err
@@ -222,7 +264,10 @@ func (s *Server) queryTCP(ctx context.Context, addr *tcpip.FullAddress, query []
 		return nil, err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(dnsTCPTimeout))
+	deadline, _ := dialCtx.Deadline()
+	conn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(dialCtx, func() { conn.SetDeadline(time.Now()) })
+	defer stopCancel()
 
 	var lenPrefix [2]byte
 	binary.BigEndian.PutUint16(lenPrefix[:], uint16(len(query)))

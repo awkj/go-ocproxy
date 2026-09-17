@@ -9,7 +9,6 @@ import (
 	"net"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -241,30 +240,30 @@ func (s *Server) resolveAndDial(ctx context.Context, host string, port uint16) (
 
 // bidirectionalCopy 在两个连接间双向拷贝，遇到一端 EOF 时半关闭对侧写端。
 //
-// 字节计数用 atomic.Int64 而非局部变量：sync.WaitGroup.Wait 提供了
-// happens-before，但 -race 仍可能误报，atomic 一劳永逸。
+// Each goroutine owns one counter. Wait publishes both results to the caller;
+// no per-direction atomic store/load is needed (including under -race).
 func bidirectionalCopy(ctx context.Context, client, tunnel net.Conn) (int64, int64) {
 	stopCancel := context.AfterFunc(ctx, func() {
 		client.SetDeadline(time.Now())
 		tunnel.SetDeadline(time.Now())
 	})
 	defer stopCancel()
-	var bytesIn, bytesOut atomic.Int64
+	var bytesIn, bytesOut int64
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		n, _ := io.Copy(tunnel, client)
-		bytesIn.Store(n)
+		bytesIn = n
 		if cw, ok := tunnel.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
 	})
 	wg.Go(func() {
 		n, _ := io.Copy(client, tunnel)
-		bytesOut.Store(n)
+		bytesOut = n
 		if cw, ok := client.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
 	})
 	wg.Wait()
-	return bytesIn.Load(), bytesOut.Load()
+	return bytesIn, bytesOut
 }
