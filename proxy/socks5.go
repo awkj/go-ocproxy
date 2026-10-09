@@ -105,6 +105,14 @@ func (s *Server) handleSOCKS5(ctx context.Context, conn net.Conn) {
 		log.Printf("[socks] %s request read failed: %v", remote, err)
 		return
 	}
+	if buf[1] == 0x03 {
+		if buf[0] != socksVer5 || buf[2] != 0 {
+			socksReply(conn, 0x01)
+			return
+		}
+		s.handleUDPAssociate(ctx, conn, buf[3])
+		return
+	}
 	if buf[1] != socksCmdConnect {
 		log.Printf("[socks] %s unsupported command: 0x%02x", remote, buf[1])
 		socksReply(conn, socksRepCmdNotSupp)

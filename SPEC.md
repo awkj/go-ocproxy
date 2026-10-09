@@ -78,9 +78,18 @@
 |----|------|----------|
 | SK-SNIFF-1 | Accept 后用 `bufio.Reader.Peek(1)` 读首字节：在 `'A'..'Z'` 范围内则交给 HTTP handler；其余（含 `0x05`）交给 SOCKS5 handler。Peek 失败按 SOCKS 同样的连接关闭路径处理。 | [TESTABLE] 发 `GET / HTTP/1.1\r\n...` 验证返回 `HTTP/1.1` 状态行；发 `{0x05, ...}` 走原 SOCKS 流程 |
 | SK-PROTO-1 | 进入 SOCKS5 handler 后，验证 `VER == 0x05`。非 0x05 时回复 `{0x05, 0xFF}`（无可接受方法）并关闭连接，日志记录 `"unsupported SOCKS version"` 和对端地址。 | [TESTABLE] 发送 `{0x04, 0x01, 0x00}`，验证收到 `{0x05, 0xFF}` 且连接被关闭 |
-| SK-PROTO-2 | 解析 SOCKS request 时，验证 CMD 字段。仅支持 CONNECT (0x01)。BIND (0x02) 和 UDP_ASSOCIATE (0x03) 回复 `REP=0x07`（Command not supported），日志记录命令类型和对端地址。 | [TESTABLE] 发送 CMD=0x03 的请求，验证收到 REP=0x07 |
+| SK-PROTO-2 | 解析 SOCKS request 时，验证 CMD 字段。支持 CONNECT (0x01) 和 UDP_ASSOCIATE (0x03)。BIND (0x02) 回复 `REP=0x07`（Command not supported），日志记录命令类型和对端地址。 | [TESTABLE] 发送 CMD=0x02 的请求，验证收到 REP=0x07 |
 | SK-PROTO-3 | ATYP=0x04 (IPv6) 读取 16 字节 IPv6 地址，正常处理连接请求。 | [TESTABLE] 发送 ATYP=0x04 的请求，验证不返回 REP=0x08 |
 | SK-PROTO-4 | 所有 SOCKS 握手阶段的 `conn.Write` 必须检查返回值。写失败时记日志并关闭连接。 | [TESTABLE] 在握手阶段关闭客户端连接，验证 server 不 panic 并有日志 |
+
+### 2.1.1 SOCKS5 UDP 转发
+
+| ID | 行为 | 验证方式 |
+|----|------|----------|
+| SK-UDP-1 | UDP_ASSOCIATE 返回 TCP 本地地址上的独立 UDP relay 端口；TCP 关闭或 context 取消时关闭全部 UDP socket 并等待转发任务退出。 | [TESTABLE] 建立会话并关闭控制连接 |
+| SK-UDP-2 | 只接受 TCP peer IP 的数据报，遵守请求中的非零源端口；源端口为零时固定为首个合法数据报的端口。请求地址只能为未指定地址或 TCP peer IP。 | [TESTABLE] 错误源地址/端口不能注入或抢占 |
+| SK-UDP-3 | 支持 IPv4、域名和可选 IPv6；目标域名由隧道 DNS 解析，所有目标 UDP 经 gVisor 发送。响应封装实际目标 IP/端口。 | [TESTABLE] 报文解析及双向 echo |
+| SK-UDP-4 | FRAG 非零、RSV 非零、非法 ATYP、短包、空域名或零目标端口均丢弃；不提供 UDP 分片重组。每会话最多 64 个目标，目标双向空闲 2 分钟后关闭。 | [TESTABLE] 畸形包、容量与空闲清理 |
 
 ### 2.2 超时
 

@@ -18,7 +18,7 @@
 - **零依赖**：编译后为单二进制文件运行，无需额外配置系统库。
 
 ## ✨ 核心功能
-- [x] **SOCKS5 代理**：默认监听 `127.0.0.1:1080`，转发 TCP 流量。
+- [x] **SOCKS5 代理**：默认监听 `127.0.0.1:1080`，支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 会话随 TCP 控制连接关闭，不支持 UDP 分片重组。
 - [x] **HTTP 代理（同端口）**：同一端口自动嗅探 HTTP 请求，支持 `CONNECT`（HTTPS 隧道）与普通 HTTP 转发（绝对 URI、自动剥离 hop-by-hop 头）。浏览器把 HTTP/HTTPS 代理都填这一个端口即可。
 - [x] **内网 DNS 转发**：自动识别并利用 VPN 内部 DNS 进行域名解析。
 - [x] **自动配置集成**：完美继承 `openconnect` 分配的 IP、MTU 和 DNS 环境变量。

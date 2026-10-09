@@ -20,7 +20,7 @@ The original `ocproxy` is written in C and carries roughly 80,000 lines of code,
 - **Self-contained**: Compiles into a single static binary with zero external dependencies.
 
 ## ✨ Features
-- [x] **SOCKS5 Proxy**: Listens on `127.0.0.1:1080` by default.
+- [x] **SOCKS5 Proxy**: TCP CONNECT and UDP ASSOCIATE, listening on `127.0.0.1:1080` by default. UDP sessions follow their TCP control connection; fragmented UDP packets are dropped.
 - [x] **HTTP Proxy (same port)**: Auto-sniffs HTTP requests on the same port. Supports `CONNECT` (HTTPS tunneling) and absolute-URI HTTP forwarding with automatic hop-by-hop header stripping.
 - [x] **Internal DNS Forwarding**: Resolves domains using VPN DNS servers automatically.
 - [x] **Auto-Config**: Inherits `INTERNAL_IP4_ADDRESS`, `MTU`, and `DNS` from `openconnect` environment variables.

@@ -404,9 +404,9 @@ func TestSOCKS5UnsupportedCommand(t *testing.T) {
 		t.Fatalf("auth failed: %x", authResp)
 	}
 
-	// 发 UDP_ASSOCIATE (0x03) 命令
+	// 发 BIND (0x02) 命令
 	conn.Write([]byte{
-		0x05, 0x03, 0x00, 0x01,
+		0x05, 0x02, 0x00, 0x01,
 		127, 0, 0, 1,
 		0x00, 0x50,
 	})
