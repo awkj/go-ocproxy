@@ -7,7 +7,7 @@
 ### Added
 - SOCKS5 UDP_ASSOCIATE：经 gVisor 隧道转发 UDP，支持域名/IPv4/可选 IPv6，绑定控制连接和来源，限制目标数量并回收空闲会话。
 
-- 更新全部 Go 依赖至当前版本，gVisor 使用 `go` 分支；编译基线升级为 Go 1.27.1。
+- 更新全部 Go 依赖至当前版本，gVisor 使用 `go` 分支；编译基线升级为 Go 1.27.3（2026-10-28）；gVisor 更新至 `206c0a5a6729`，同步更新 x/net、x/sys 与 x/exp。
 
 ### Fixed
 - 同一域名的并发 DNS cache miss 合并为一次在途查询；调用方独立取消，最后一个
