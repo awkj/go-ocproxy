@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -478,6 +479,17 @@ func TestSOCKS5IPv4OnlyResolve(t *testing.T) {
 	}
 	if ip.To4() == nil {
 		t.Fatalf("expected IPv4 result, got %v", ip)
+	}
+}
+
+func TestUsableSystemIPUnmapsIPv4MappedAddress(t *testing.T) {
+	addrs := []netip.Addr{
+		netip.MustParseAddr("2001:db8::1"),
+		netip.MustParseAddr("::ffff:192.0.2.1"),
+	}
+	got := usableSystemIP(addrs, true)
+	if !got.Equal(net.ParseIP("192.0.2.1")) {
+		t.Fatalf("usableSystemIP = %v, want 192.0.2.1", got)
 	}
 }
 

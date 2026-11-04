@@ -3,6 +3,13 @@ version: 2
 project_name: go-ocproxy
 
 archives:
+  - id: linux
+    ids:
+      - linux-amd64
+    formats:
+      - tar.gz
+    files:
+      - none*
   - id: macos
     ids:
       - macos-arm64
@@ -18,6 +25,17 @@ archives:
     files:
       - none*
 builds:
+  - id: linux-amd64
+    main: .
+    goos:
+      - linux
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
   - id: macos-arm64
     main: .
     goos:

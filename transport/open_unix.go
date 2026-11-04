@@ -1,3 +1,5 @@
+//go:build darwin || linux
+
 package transport
 
 import (
@@ -8,11 +10,11 @@ import (
 )
 
 // OpenFromEnv opens the AF_UNIX datagram inherited from OpenConnect's
-// --script-tun child process.
+// --script-tun child process on Unix.
 func OpenFromEnv() (net.Conn, error) {
 	value := os.Getenv("VPNFD")
 	if value == "" {
-		return nil, fmt.Errorf("VPNFD is required on macOS")
+		return nil, fmt.Errorf("VPNFD is required on macOS and Linux")
 	}
 	fd, err := strconv.Atoi(value)
 	if err != nil || fd < 0 {

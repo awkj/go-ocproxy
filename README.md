@@ -24,17 +24,18 @@ The original `ocproxy` is written in C and carries roughly 80,000 lines of code,
 - [x] **HTTP Proxy (same port)**: Auto-sniffs HTTP requests on the same port. Supports `CONNECT` (HTTPS tunneling) and absolute-URI HTTP forwarding with automatic hop-by-hop header stripping.
 - [x] **Internal DNS Forwarding**: Resolves domains using VPN DNS servers automatically.
 - [x] **Auto-Config**: Inherits `INTERNAL_IP4_ADDRESS`, `MTU`, and `DNS` from `openconnect` environment variables.
+- [x] **Linux support**: Uses OpenConnect's inherited `VPNFD` datagram descriptor with `--script-tun`, like macOS.
 - [x] **Packet Boundary Logic**: Robust handling of IP packet streams for stable long-lived connections.
 
 ## 🛠️ Build
-Requires the latest stable Go release (currently Go 1.27.1).
+Requires the latest stable Go release (currently Go 1.27.3).
 ```bash
 cd go-ocproxy
 go build -o go-ocproxy
 ```
 
 ## 📖 Usage
-Run it as an `openconnect` script:
+Run it as an `openconnect` script on Linux or macOS:
 ```bash
 sudo openconnect \
     --script-tun \
@@ -43,6 +44,10 @@ sudo openconnect \
 ```
 
 The listening port accepts both SOCKS5 and HTTP proxy connections. In your browser/system proxy settings, point HTTP, HTTPS, and SOCKS all at `127.0.0.1:1080`.
+
+On Linux and macOS, `--script-tun` passes the connected `AF_UNIX/SOCK_DGRAM`
+transport as `VPNFD`; go-ocproxy reads and writes complete IP packets through it.
+Release targets include Linux amd64 and macOS arm64.
 
 On Windows, OpenConnect does not expose `--script-tun`. An external libopenconnect
 helper can start go-ocproxy with a connected loopback UDP transport in

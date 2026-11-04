@@ -24,7 +24,7 @@
 
 ```
 OpenConnect transport
-  ├─ macOS: VPNFD / AF_UNIX SOCK_DGRAM
+  ├─ Linux/macOS: VPNFD / AF_UNIX SOCK_DGRAM
   └─ Windows: VPN_UDP_PEER / connected loopback UDP
                          │
                          ▼
@@ -47,8 +47,8 @@ OpenConnect transport
 
 ## 支持平台与边界
 
-- 发布目标只有 **macOS arm64** 和 **Windows amd64**。
-- macOS 通过 `VPNFD` 接收 OpenConnect `--script-tun` 的 AF_UNIX datagram fd。
+- 发布目标为 **Linux amd64**、**macOS arm64** 和 **Windows amd64**。
+- Linux/macOS 通过 `VPNFD` 接收 OpenConnect `--script-tun` 的 AF_UNIX datagram fd。
 - Windows 通过 `VPN_UDP_PEER` 接收外部 libopenconnect helper 提供的 connected loopback UDP；helper 必须设置随机 `VPN_UDP_TOKEN` 并校验首个 datagram 与 token 完全一致。
 - 本仓库保持产品中立：协议名、环境变量、日志和文档不得包含具体消费方名称。消费方专属的进程编排、分流规则和 UI 不进入本仓库。
 
@@ -70,11 +70,11 @@ gVisor 的 `*PacketBuffer` 用引用计数管理。`channel.Endpoint.ReadContext
 
 ### 3. Transport 必须是单一双向 `net.Conn`
 
-macOS 只在 `transport` 中把 `VPNFD` 转换一次为 `net.Conn`，随后关闭继承的原 fd；Windows 直接使用 connected `*net.UDPConn`。`NetStack.Run` 只接收一个双向 `net.Conn`，不能重新引入 input/output 两套句柄或裸 `*os.File.Write`。否则 `net.FileConn` 的 dup/O_NONBLOCK 语义会造成 EAGAIN 丢包，并让读写实际落在不同对象上。
+Linux/macOS 只在 `transport` 中把 `VPNFD` 转换一次为 `net.Conn`，随后关闭继承的原 fd；Windows 直接使用 connected `*net.UDPConn`。`NetStack.Run` 只接收一个双向 `net.Conn`，不能重新引入 input/output 两套句柄或裸 `*os.File.Write`。否则 `net.FileConn` 的 dup/O_NONBLOCK 语义会造成 EAGAIN 丢包，并让读写实际落在不同对象上。
 
-### 4. macOS ENOBUFS 不能当 fatal
+### 4. Unix ENOBUFS 不能当 fatal
 
-macOS 上 AF_UNIX SOCK_DGRAM 在高吞吐时会因系统 mbuf 池**暂时耗尽**返回 `ENOBUFS`。这是 transient 错误，但 Go runtime poller **不会自动重试** ENOBUFS（它只重试 EAGAIN）。
+Unix 上 AF_UNIX SOCK_DGRAM 在高吞吐时可能因系统 socket buffer 暂时耗尽返回 `ENOBUFS`。这是 transient 错误，但 Go runtime poller **不会自动重试** ENOBUFS（它只重试 EAGAIN）。
 
 - ❌ 当 fatal → 整个 SOCKS5 服务挂掉
 - ❌ 当 transient 静默丢包 → TCP 触发重传，重传又遇 ENOBUFS，连接事实停滞
@@ -82,15 +82,15 @@ macOS 上 AF_UNIX SOCK_DGRAM 在高吞吐时会因系统 mbuf 池**暂时耗尽*
 
 详见 `netstack/netstack.go` 的 `writeOutboundWithRetry`。
 
-### 5. macOS AF_UNIX 默认 SO_SNDBUF 极小
+### 5. AF_UNIX 默认 SO_SNDBUF 可能较小
 
-约 8 KiB，遇到 1500B IP 包瞬间灌满。`NetStack.Run` 通过 `net.UnixConn` / `net.UDPConn` 的 portable buffer setter 请求把读写缓冲调到 1 MiB；不要新增平台 syscall 分支。
+Linux/macOS 默认 socket buffer 可能较小，高吞吐时容易灌满。`NetStack.Run` 通过 `net.UnixConn` / `net.UDPConn` 的 portable buffer setter 请求把读写缓冲调到 1 MiB；不要新增平台 syscall 分支。
 
-### 6. socketpair 对端死亡检测
+### 6. Unix transport peer health check
 
 AF_UNIX SOCK_DGRAM 没有 TCP 那种 EOF 概念——对端 `close()` 后，本端的 `Read` 不一定立刻返回错误（macOS 上实测会一直阻塞）。inbound `Read` 退出路径不可靠。
 
-解决：独立 goroutine 每秒 `getpeername()` 探测，对端关闭后会返回 `ENOTCONN`。**不要**用 0 字节 write 探（某些平台是 no-op），也不要发真正的探测包（污染 VPN 流量）。
+macOS 用独立 goroutine 每秒 `getpeername()` 探测对端状态。Linux 的 `getpeername` 和 `poll` 不报告 AF_UNIX datagram 对端关闭，因此使用 `SO_PEERCRED` 获取 OpenConnect PID，再用 pidfd 监测进程退出；pidfd 不可用的旧内核依赖 OpenConnect 的进程监督。**不要**用 0 字节 write 探（某些平台是 no-op），也不要发真正的探测包（污染 VPN 流量）。
 
 ### 7. SOCKS5 收到域名时的 DNS 解析
 
