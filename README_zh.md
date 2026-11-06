@@ -22,17 +22,18 @@
 - [x] **HTTP 代理（同端口）**：同一端口自动嗅探 HTTP 请求，支持 `CONNECT`（HTTPS 隧道）与普通 HTTP 转发（绝对 URI、自动剥离 hop-by-hop 头）。浏览器把 HTTP/HTTPS 代理都填这一个端口即可。
 - [x] **内网 DNS 转发**：自动识别并利用 VPN 内部 DNS 进行域名解析。
 - [x] **自动配置集成**：完美继承 `openconnect` 分配的 IP、MTU 和 DNS 环境变量。
+- [x] **Linux 支持**：通过 `--script-tun` 使用 OpenConnect 继承的 `VPNFD` 数据报描述符，与 macOS 相同。
 - [x] **稳定流处理**：精确的 IP 数据包边界处理，确保长连接稳定性。
 
 ## 🛠️ 编译
-需要最新稳定版 Go（当前为 Go 1.27.1）。
+需要最新稳定版 Go（当前为 Go 1.27.3）。
 ```bash
 cd go-ocproxy
 go build -o go-ocproxy
 ```
 
 ## 📖 使用方法
-在启动 `openconnect` 时，作为脚本参数运行：
+在 Linux 或 macOS 上启动 `openconnect` 时，作为脚本参数运行：
 ```bash
 sudo openconnect \
     --script-tun \
@@ -44,6 +45,10 @@ sudo openconnect \
 - HTTP 代理：`127.0.0.1:1080`
 - HTTPS 代理：`127.0.0.1:1080`
 - SOCKS 代理：`127.0.0.1:1080`
+
+Linux 和 macOS 的 `--script-tun` 会通过 `VPNFD` 传入已连接的
+`AF_UNIX/SOCK_DGRAM` transport；go-ocproxy 在该通道上按完整 IP 数据包读写。
+发布目标包含 Linux amd64 和 macOS arm64。
 
 Windows 上的 OpenConnect 不提供 `--script-tun`。外部 libopenconnect helper 可通过
 `VPN_UDP_PEER=127.0.0.1:<port>` 启动 go-ocproxy，使用 connected loopback UDP

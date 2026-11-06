@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/awkj/go-ocproxy/internal/sigctx"
 	"github.com/awkj/go-ocproxy/netstack"
 	"github.com/awkj/go-ocproxy/proxy"
 	"github.com/awkj/go-ocproxy/transport"
@@ -105,7 +106,7 @@ func run() error {
 		return fmt.Errorf("listen on %s: %w", listenAddr, err)
 	}
 
-	ctx, ctxCancel := newSignalContext(context.Background(), server.DumpStats)
+	ctx, ctxCancel := sigctx.New(context.Background(), server.DumpStats)
 	defer ctxCancel()
 
 	tunnel, err := transport.OpenFromEnv()

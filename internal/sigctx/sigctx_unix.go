@@ -1,6 +1,6 @@
 //go:build !windows
 
-package main
+package sigctx
 
 import (
 	"context"
@@ -9,7 +9,8 @@ import (
 	"syscall"
 )
 
-func newSignalContext(parent context.Context, dumpStats func()) (context.Context, context.CancelFunc) {
+// New returns a context cancelled on shutdown signals; dumpStats runs on SIGUSR1 where supported.
+func New(parent context.Context, dumpStats func()) (context.Context, context.CancelFunc) {
 	ctx, cancel := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	statsCh := make(chan os.Signal, 1)
 	signal.Notify(statsCh, syscall.SIGUSR1)

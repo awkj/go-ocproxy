@@ -159,7 +159,7 @@ func (ns *NetStack) DialUDP(ctx context.Context, addr *tcpip.FullAddress) (net.C
 }
 
 // Run moves complete IP packets between gVisor and one bidirectional datagram
-// tunnel: AF_UNIX SOCK_DGRAM on macOS or connected loopback UDP on Windows.
+// tunnel: AF_UNIX SOCK_DGRAM on macOS/Linux or connected loopback UDP on Windows.
 func (ns *NetStack) Run(ctx context.Context, tunnel net.Conn) error {
 	innerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -244,8 +244,8 @@ func (ns *NetStack) Run(ctx context.Context, tunnel net.Conn) error {
 		}
 	}()
 
-	// Platform policy differs: macOS can inspect its AF_UNIX peer; Windows UDP
-	// relies on the external helper's process supervision.
+	// macOS inspects its AF_UNIX peer; Linux monitors the OpenConnect process;
+	// Windows UDP relies on the external helper's process supervision.
 	go func() {
 		if err := monitorTunnel(innerCtx, tunnel); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[health] vpn health check failed: %v", err)

@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -98,19 +99,8 @@ func (s *Server) queryDNS(ctx context.Context, name string) (net.IP, time.Durati
 		if err != nil {
 			return nil, 0, err
 		}
-		for _, addr := range addrs {
-			if addr.Is4() {
-				v4 := addr.As4()
-				return net.IP(v4[:]), dnsCacheFallbackTTL, nil
-			}
-		}
-		if s.ns.HasIPv6 {
-			for _, addr := range addrs {
-				if addr.Is6() {
-					v6 := addr.As16()
-					return net.IP(v6[:]), dnsCacheFallbackTTL, nil
-				}
-			}
+		if ip := usableSystemIP(addrs, s.ns.HasIPv6); ip != nil {
+			return ip, dnsCacheFallbackTTL, nil
 		}
 		return nil, 0, fmt.Errorf("no usable IP address for %s", name)
 	}
@@ -160,6 +150,25 @@ func (s *Server) queryDNS(ctx context.Context, name string) (net.IP, time.Durati
 		lastErr = fmt.Errorf("no usable IP address for %s", name)
 	}
 	return nil, 0, lastErr
+}
+
+func usableSystemIP(addrs []netip.Addr, hasIPv6 bool) net.IP {
+	for _, addr := range addrs {
+		addr = addr.Unmap()
+		if addr.Is4() {
+			v4 := addr.As4()
+			return net.IP(v4[:])
+		}
+	}
+	if hasIPv6 {
+		for _, addr := range addrs {
+			if addr.Is6() {
+				v6 := addr.As16()
+				return net.IP(v6[:])
+			}
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

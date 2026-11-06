@@ -103,7 +103,7 @@
 | ID | 行为 | 验证方式 |
 |----|------|----------|
 | SK-IP-1 | `resolve()` 优先返回 IPv4（A 记录）。当栈有 IPv6 且 A 查询无结果时，回退到 AAAA 记录。不配置 IPv6 时，只查 A 记录。 | [TESTABLE] 验证优先返回 IPv4；栈有 IPv6 时能返回 AAAA 结果 |
-| SK-IP-2 | 系统 resolver fallback 必须调用可取消的 `net.DefaultResolver.LookupNetIP(ctx, ...)` 并优先选 IPv4；无 IPv4 且栈有 IPv6 时选 IPv6。 | [TESTABLE] 取消 context，验证解析及时停止；验证 IPv4 优先 |
+| SK-IP-2 | 系统 resolver fallback 必须调用可取消的 `net.DefaultResolver.LookupNetIP(ctx, ...)` 并优先选 IPv4；IPv4-mapped IPv6 地址必须按 IPv4 处理；无 IPv4 且栈有 IPv6 时选 IPv6。 | [TESTABLE] 取消 context，验证解析及时停止；验证 IPv4 优先及 mapped 地址处理 |
 
 ### 2.4 连接生命周期
 
@@ -260,19 +260,29 @@ go-ocproxy 使用标准 `log` 包。所有日志行以方括号标签开头标�
 | WIN-BUILD-1 | `GOOS=windows GOARCH=amd64 go build` 必须成功，产出可由外部 libopenconnect helper 通过 `VPN_UDP_PEER` 启动的 PE32+ 可执行文件。 | [TESTABLE] Windows CI/native build |
 | WIN-LIFE-1 | connected UDP 的 `getpeername` 只能验证 peer 已配置，不能可靠判断 helper 进程仍存活；Windows helper 必须把 go-ocproxy 纳入自身生命周期管理，helper 或父进程退出时同步终止 go-ocproxy。 | [MANUAL] 终止 helper/父进程，确认 go-ocproxy 被回收 |
 
+### 6.0.1 Linux 平台适配
+
+| ID | 行为 | 验证方式 |
+|----|------|----------|
+| LINUX-FD-1 | Linux 使用 OpenConnect `--script-tun` 继承的 `VPNFD`，通过 `net.FileConn` 转成单一双向 `AF_UNIX/SOCK_DGRAM` `net.Conn`；每个 read/write 对应一个完整 IP 包。 | [TESTABLE] Linux socketpair 双向 datagram 测试 |
+| LINUX-HEALTH-1 | Linux 从 AF_UNIX `SO_PEERCRED` 取得 OpenConnect 进程，并通过 pidfd 监测其退出；不发送探测数据。pidfd 不受支持的旧内核回退到父进程监督。 | [TESTABLE] 验证 monitor 等待 context 取消；[MANUAL] 结束 OpenConnect 后确认进程退出 |
+| LINUX-BUILD-1 | `GOOS=linux GOARCH=amd64 go build` 和 Linux 原生 `go test ./...` 必须成功。 | [TESTABLE] Linux CI |
+
 ### 6.1 单元测试（不需要真实 openconnect）
 
 | 测试文件 | 覆盖 |
 |----------|------|
 | `netstack/netstack_darwin_test.go` | S-IN-*, S-OUT-*, S-CH-1, isFatalWriteErr, writeOutboundWithRetry |
+| `netstack/monitor_linux_test.go` | Linux OpenConnect process liveness |
 | `netstack/monitor_windows_test.go` | Windows UDP transport 与 Run 生命周期 |
+| `transport/open_linux_test.go` | Linux inherited `VPNFD` datagram transport |
 | `transport/open_windows_test.go` | loopback/token 校验与双向 datagram |
 | `proxy/proxy_test.go` | SOCKS5、HTTP、DNS、cache、限流与生命周期 |
 
 ### 6.2 平台集成测试
 
-平台集成测试与单元测试放在同一包中，通过 `_darwin_test.go` / `_windows_test.go`
-文件名选择目标系统；CI 在 macOS 与 Windows 原生执行测试，并交叉构建 macOS arm64 / Windows amd64 发布目标。真实 OpenConnect
+平台集成测试与单元测试放在同一包中，通过 `_darwin_test.go` / `_linux_test.go` /
+`_windows_test.go` 文件名选择目标系统；CI 在 Linux、macOS 与 Windows 原生执行测试，并构建 Linux amd64 / macOS arm64 / Windows amd64 发布目标。真实 OpenConnect
 链路仍需发布前手工 smoke test。
 
 ---
@@ -287,7 +297,7 @@ go-ocproxy 使用标准 `log` 包。所有日志行以方括号标签开头标�
 | 事件模型 | libevent（单线程回调） | goroutine-per-connection | Go 惯用模式 |
 | 端口转发 `-L` | 支持 | 不支持 | 当前不需要，SOCKS5 已覆盖所有场景 |
 | 远程访问 `-g` | 支持 | 不支持（硬编码 127.0.0.1） | 安全考虑，不暴露到非本机 |
-| vpnns 命名空间隔离 | 支持（Linux） | 不支持 | 目标平台 macOS，无 Linux namespace |
+| vpnns 命名空间隔离 | 支持（Linux） | 不支持 | namespace 管理不属于本项目的跨平台代理进程职责 |
 | tcpdump `-T` | 支持 | 不支持 | 暂不需要 |
 | 出站写阻塞策略 | C `write()` + `select`/`poll` 显式等可写 | `net.Conn.Write` 走 Go runtime poller，ENOBUFS 由 `writeOutboundWithRetry` 退避重试 | Go 语言惯用法；同时绕开 `net.FileConn` 把 dup fd 设 `O_NONBLOCK` 影响共享 file description 的隐性问题（详见 `AGENTS.md` 的"非阻塞 fd 陷阱"） |
 | Windows 统计信号 | N/A | 不支持 SIGUSR1；保留正常日志和退出控制信号 | Windows 控制台没有 POSIX SIGUSR1 |

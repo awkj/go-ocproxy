@@ -5,11 +5,13 @@
 ## [Unreleased]
 
 ### Added
+- Linux amd64 支持：复用 Unix `VPNFD` / `AF_UNIX/SOCK_DGRAM` transport，增加 Linux 原生测试、CI 与 GoReleaser 发布目标。
 - SOCKS5 UDP_ASSOCIATE：经 gVisor 隧道转发 UDP，支持域名/IPv4/可选 IPv6，绑定控制连接和来源，限制目标数量并回收空闲会话。
 
 - 更新全部 Go 依赖至当前版本，gVisor 使用 `go` 分支；编译基线升级为 Go 1.27.3（2026-10-28）；gVisor 更新至 `206c0a5a6729`，同步更新 x/net、x/sys 与 x/exp。
 
 ### Fixed
+- 系统 resolver 返回 IPv4-mapped IPv6 地址时按 IPv4 处理，避免 Linux 静态构建使用纯 Go resolver 时无法解析 IPv4 主机。
 - 同一域名的并发 DNS cache miss 合并为一次在途查询；调用方独立取消，最后一个
   等待者离开后中止查询。DNS UDP/TCP I/O 响应 context 取消，取消与超时不再污染负缓存。
 - Windows 新增通用 `VPN_UDP_PEER` 数据报 transport，供外部 libopenconnect helper
