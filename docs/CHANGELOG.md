@@ -6,6 +6,7 @@
 
 ### Added
 - Linux amd64 支持：复用 Unix `VPNFD` / `AF_UNIX/SOCK_DGRAM` transport，增加 Linux 原生测试、CI 与 GoReleaser 发布目标。
+- 添加 MIT 许可证与中英文许可说明，Linux / macOS / Windows 发布归档包含 `LICENSE`（#5）。
 - SOCKS5 UDP_ASSOCIATE：经 gVisor 隧道转发 UDP，支持域名/IPv4/可选 IPv6，绑定控制连接和来源，限制目标数量并回收空闲会话。
 
 - 更新全部 Go 依赖至当前版本，gVisor 使用 `go` 分支；编译基线升级为 Go 1.27.3（2026-10-28）；gVisor 更新至 `206c0a5a6729`，同步更新 x/net、x/sys 与 x/exp。

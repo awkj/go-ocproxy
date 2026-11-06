@@ -9,21 +9,21 @@ archives:
     formats:
       - tar.gz
     files:
-      - none*
+      - LICENSE
   - id: macos
     ids:
       - macos-arm64
     formats:
       - tar.gz
     files:
-      - none*
+      - LICENSE
   - id: windows
     ids:
       - windows-amd64
     formats:
       - zip
     files:
-      - none*
+      - LICENSE
 builds:
   - id: linux-amd64
     main: .
