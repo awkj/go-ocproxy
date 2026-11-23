@@ -19,7 +19,7 @@ jobs:
             target_os: linux
             target_arch: amd64
             binary: go-ocproxy-ci
-          - os: macos-14
+          - os: macos-latest
             target_os: darwin
             target_arch: arm64
             binary: go-ocproxy-ci
