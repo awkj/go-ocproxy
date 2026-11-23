@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## v1.2.0 - 2026-11-24
+
 ### Added
 - Linux amd64 支持：复用 Unix `VPNFD` / `AF_UNIX/SOCK_DGRAM` transport，增加 Linux 原生测试、CI 与 GoReleaser 发布目标。
 - 添加 MIT 许可证与中英文许可说明，Linux / macOS / Windows 发布归档包含 `LICENSE`（#5）。
